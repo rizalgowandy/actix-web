@@ -1,45 +1,45 @@
-use std::{convert::TryFrom, fmt, net, rc::Rc, time::Duration};
-
-use bytes::Bytes;
-use futures_core::Stream;
-use serde::Serialize;
+use std::{fmt, net, rc::Rc, time::Duration};
 
 use actix_http::{
+    body::MessageBody,
     error::HttpError,
     header::{self, HeaderMap, HeaderValue, TryIntoHeaderPair},
     ConnectionType, Method, RequestHead, Uri, Version,
 };
-
-use crate::{
-    any_body::AnyBody,
-    error::{FreezeRequestError, InvalidUrl},
-    frozen::FrozenClientRequest,
-    sender::{PrepForSendingError, RequestSender, SendClientRequest},
-    BoxError, ClientConfig,
-};
+use base64::prelude::*;
+use bytes::Bytes;
+use futures_core::Stream;
+use serde::Serialize;
 
 #[cfg(feature = "cookies")]
 use crate::cookie::{Cookie, CookieJar};
+use crate::{
+    client::ClientConfig,
+    error::{FreezeRequestError, InvalidUrl},
+    frozen::FrozenClientRequest,
+    sender::{PrepForSendingError, RequestSender, SendClientRequest},
+    BoxError,
+};
 
 /// An HTTP Client request builder
 ///
 /// This type can be used to construct an instance of `ClientRequest` through a
 /// builder-like pattern.
 ///
-/// ```
-/// #[actix_rt::main]
-/// async fn main() {
-///    let response = awc::Client::new()
-///         .get("http://www.rust-lang.org") // <- Create request builder
-///         .insert_header(("User-Agent", "Actix-web"))
-///         .send()                          // <- Send HTTP request
-///         .await;
+/// ```no_run
+/// # #[actix_rt::main]
+/// # async fn main() {
+/// let response = awc::Client::new()
+///      .get("http://www.rust-lang.org") // <- Create request builder
+///      .insert_header(("User-Agent", "Actix-web"))
+///      .send()                          // <- Send HTTP request
+///      .await;
 ///
-///    response.and_then(|response| {   // <- server HTTP response
-///         println!("Response: {:?}", response);
-///         Ok(())
-///    });
-/// }
+/// response.and_then(|response| {   // <- server HTTP response
+///      println!("Response: {:?}", response);
+///      Ok(())
+/// });
+/// # }
 /// ```
 pub struct ClientRequest {
     pub(crate) head: RequestHead,
@@ -83,7 +83,7 @@ impl ClientRequest {
     {
         match Uri::try_from(uri) {
             Ok(uri) => self.head.uri = uri,
-            Err(e) => self.err = Some(e.into()),
+            Err(err) => self.err = Some(err.into()),
         }
         self
     }
@@ -152,7 +152,7 @@ impl ClientRequest {
             Ok((key, value)) => {
                 self.head.headers.insert(key, value);
             }
-            Err(e) => self.err = Some(e.into()),
+            Err(err) => self.err = Some(err.into()),
         };
 
         self
@@ -166,7 +166,7 @@ impl ClientRequest {
                     self.head.headers.insert(key, value);
                 }
             }
-            Err(e) => self.err = Some(e.into()),
+            Err(err) => self.err = Some(err.into()),
         };
 
         self
@@ -174,22 +174,18 @@ impl ClientRequest {
 
     /// Append a header, keeping any that were set with an equivalent field name.
     ///
-    /// ```
-    /// # #[actix_rt::main]
-    /// # async fn main() {
-    /// # use awc::Client;
-    /// use awc::http::header::CONTENT_TYPE;
+    /// ```no_run
+    /// use awc::{http::header, Client};
     ///
     /// Client::new()
     ///     .get("http://www.rust-lang.org")
     ///     .insert_header(("X-TEST", "value"))
-    ///     .insert_header((CONTENT_TYPE, mime::APPLICATION_JSON));
-    /// # }
+    ///     .insert_header((header::CONTENT_TYPE, mime::APPLICATION_JSON));
     /// ```
     pub fn append_header(mut self, header: impl TryIntoHeaderPair) -> Self {
         match header.try_into_pair() {
             Ok((key, value)) => self.head.headers.append(key, value),
-            Err(e) => self.err = Some(e.into()),
+            Err(err) => self.err = Some(err.into()),
         };
 
         self
@@ -221,7 +217,7 @@ impl ClientRequest {
             Ok(value) => {
                 self.head.headers.insert(header::CONTENT_TYPE, value);
             }
-            Err(e) => self.err = Some(e.into()),
+            Err(err) => self.err = Some(err.into()),
         }
         self
     }
@@ -241,7 +237,7 @@ impl ClientRequest {
 
         self.insert_header((
             header::AUTHORIZATION,
-            format!("Basic {}", base64::encode(&auth)),
+            format!("Basic {}", BASE64_STANDARD.encode(auth)),
         ))
     }
 
@@ -252,23 +248,18 @@ impl ClientRequest {
 
     /// Set a cookie
     ///
-    /// ```
-    /// #[actix_rt::main]
-    /// async fn main() {
-    ///     let resp = awc::Client::new().get("https://www.rust-lang.org")
-    ///         .cookie(
-    ///             awc::cookie::Cookie::build("name", "value")
-    ///                 .domain("www.rust-lang.org")
-    ///                 .path("/")
-    ///                 .secure(true)
-    ///                 .http_only(true)
-    ///                 .finish(),
-    ///          )
-    ///          .send()
-    ///          .await;
+    /// ```no_run
+    /// use awc::{cookie::Cookie, Client};
     ///
-    ///     println!("Response: {:?}", resp);
-    /// }
+    /// # #[actix_rt::main]
+    /// # async fn main() {
+    /// let res = Client::new().get("https://httpbin.org/cookies")
+    ///     .cookie(Cookie::new("name", "value"))
+    ///     .send()
+    ///     .await;
+    ///
+    /// println!("Response: {:?}", res);
+    /// # }
     /// ```
     #[cfg(feature = "cookies")]
     pub fn cookie(mut self, cookie: Cookie<'_>) -> Self {
@@ -298,10 +289,7 @@ impl ClientRequest {
     }
 
     /// Sets the query part of the request
-    pub fn query<T: Serialize>(
-        mut self,
-        query: &T,
-    ) -> Result<Self, serde_urlencoded::ser::Error> {
+    pub fn query<T: Serialize>(mut self, query: &T) -> Result<Self, serde_urlencoded::ser::Error> {
         let mut parts = self.head.uri.clone().into_parts();
 
         if let Some(path_and_query) = parts.path_and_query {
@@ -311,7 +299,7 @@ impl ClientRequest {
 
             match Uri::from_parts(parts) {
                 Ok(uri) => self.head.uri = uri,
-                Err(e) => self.err = Some(e.into()),
+                Err(err) => self.err = Some(err.into()),
             }
         }
 
@@ -323,7 +311,7 @@ impl ClientRequest {
     pub fn freeze(self) -> Result<FrozenClientRequest, FreezeRequestError> {
         let slf = match self.prep_for_sending() {
             Ok(slf) => slf,
-            Err(e) => return Err(e.into()),
+            Err(err) => return Err(err.into()),
         };
 
         let request = FrozenClientRequest {
@@ -340,11 +328,11 @@ impl ClientRequest {
     /// Complete request construction and send body.
     pub fn send_body<B>(self, body: B) -> SendClientRequest
     where
-        B: Into<AnyBody>,
+        B: MessageBody + 'static,
     {
         let slf = match self.prep_for_sending() {
             Ok(slf) => slf,
-            Err(e) => return e.into(),
+            Err(err) => return err.into(),
         };
 
         RequestSender::Owned(slf.head).send_body(
@@ -360,7 +348,7 @@ impl ClientRequest {
     pub fn send_json<T: Serialize>(self, value: &T) -> SendClientRequest {
         let slf = match self.prep_for_sending() {
             Ok(slf) => slf,
-            Err(e) => return e.into(),
+            Err(err) => return err.into(),
         };
 
         RequestSender::Owned(slf.head).send_json(
@@ -378,7 +366,7 @@ impl ClientRequest {
     pub fn send_form<T: Serialize>(self, value: &T) -> SendClientRequest {
         let slf = match self.prep_for_sending() {
             Ok(slf) => slf,
-            Err(e) => return e.into(),
+            Err(err) => return err.into(),
         };
 
         RequestSender::Owned(slf.head).send_form(
@@ -393,12 +381,12 @@ impl ClientRequest {
     /// Set an streaming body and generate `ClientRequest`.
     pub fn send_stream<S, E>(self, stream: S) -> SendClientRequest
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin + 'static,
+        S: Stream<Item = Result<Bytes, E>> + 'static,
         E: Into<BoxError> + 'static,
     {
         let slf = match self.prep_for_sending() {
             Ok(slf) => slf,
-            Err(e) => return e.into(),
+            Err(err) => return err.into(),
         };
 
         RequestSender::Owned(slf.head).send_stream(
@@ -414,7 +402,7 @@ impl ClientRequest {
     pub fn send(self) -> SendClientRequest {
         let slf = match self.prep_for_sending() {
             Ok(slf) => slf,
-            Err(e) => return e.into(),
+            Err(err) => return err.into(),
         };
 
         RequestSender::Owned(slf.head).send(
@@ -427,8 +415,8 @@ impl ClientRequest {
 
     // allow unused mut when cookies feature is disabled
     fn prep_for_sending(#[allow(unused_mut)] mut self) -> Result<Self, PrepForSendingError> {
-        if let Some(e) = self.err {
-            return Err(e.into());
+        if let Some(err) = self.err {
+            return Err(err.into());
         }
 
         // validate uri
@@ -513,7 +501,7 @@ impl fmt::Debug for ClientRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "\nClientRequest {:?} {}:{}",
+            "\nClientRequest {:?} {} {}",
             self.head.version, self.head.method, self.head.uri
         )?;
         writeln!(f, "  headers:")?;
@@ -573,6 +561,8 @@ mod tests {
         assert_eq!(req.head.version, Version::HTTP_2);
 
         let _ = req.headers_mut();
+
+        #[allow(clippy::let_underscore_future)]
         let _ = req.send_body("");
     }
 

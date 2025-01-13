@@ -4,7 +4,7 @@ use std::{
     future::Future,
     marker::PhantomData,
     net,
-    pin::Pin,
+    pin::{pin, Pin},
     rc::Rc,
     task::{Context, Poll},
 };
@@ -19,15 +19,16 @@ use h2::{
     server::{Connection, SendResponse},
     Ping, PingPong,
 };
-use log::{error, trace};
 use pin_project_lite::pin_project;
 
 use crate::{
     body::{BodySize, BoxBody, MessageBody},
     config::ServiceConfig,
-    header::{HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING},
+    header::{
+        HeaderName, HeaderValue, CONNECTION, CONTENT_LENGTH, DATE, TRANSFER_ENCODING, UPGRADE,
+    },
     service::HttpFlow,
-    Extensions, OnConnectData, Payload, Request, Response, ResponseHead,
+    Extensions, Method, OnConnectData, Payload, Request, Response, ResponseHead,
 };
 
 const CHUNK_SIZE: usize = 16_384;
@@ -57,15 +58,15 @@ where
         conn_data: OnConnectData,
         timer: Option<Pin<Box<Sleep>>>,
     ) -> Self {
-        let ping_pong = config.keep_alive().map(|dur| H2PingPong {
+        let ping_pong = config.keep_alive().duration().map(|dur| H2PingPong {
             timer: timer
                 .map(|mut timer| {
-                    // reset timer if it's received from new function.
-                    timer.as_mut().reset(config.now() + dur);
+                    // reuse timer slot if it was initialized for handshake
+                    timer.as_mut().reset((config.now() + dur).into());
                     timer
                 })
                 .unwrap_or_else(|| Box::pin(sleep(dur))),
-            on_flight: false,
+            in_flight: false,
             ping_pong: conn.ping_pong().unwrap(),
         });
 
@@ -82,9 +83,14 @@ where
 }
 
 struct H2PingPong {
-    timer: Pin<Box<Sleep>>,
-    on_flight: bool,
+    /// Handle to send ping frames from the peer.
     ping_pong: PingPong,
+
+    /// True when a ping has been sent and is waiting for a reply.
+    in_flight: bool,
+
+    /// Timeout for pong response.
+    timer: Pin<Box<Sleep>>,
 }
 
 impl<T, S, B, X, U> Future for Dispatcher<T, S, B, X, U>
@@ -111,6 +117,7 @@ where
                     let payload = crate::h2::Payload::new(body);
                     let pl = Payload::H2 { payload };
                     let mut req = Request::with_payload(pl);
+                    let head_req = parts.method == Method::HEAD;
 
                     let head = req.head_mut();
                     head.uri = parts.uri;
@@ -119,7 +126,7 @@ where
                     head.headers = parts.headers.into();
                     head.peer_addr = this.peer_addr;
 
-                    req.conn_data = this.conn_data.as_ref().map(Rc::clone);
+                    req.conn_data.clone_from(&this.conn_data);
 
                     let fut = this.flow.service.call(req);
                     let config = this.config.clone();
@@ -128,10 +135,10 @@ where
                     actix_rt::spawn(async move {
                         // resolve service call and send response.
                         let res = match fut.await {
-                            Ok(res) => handle_response(res.into(), tx, config).await,
+                            Ok(res) => handle_response(res.into(), tx, config, head_req).await,
                             Err(err) => {
                                 let res: Response<BoxBody> = err.into();
-                                handle_response(res, tx, config).await
+                                handle_response(res, tx, config, head_req).await
                             }
                         };
 
@@ -139,45 +146,49 @@ where
                         if let Err(err) = res {
                             match err {
                                 DispatchError::SendResponse(err) => {
-                                    trace!("Error sending HTTP/2 response: {:?}", err)
+                                    tracing::trace!("Error sending response: {err:?}");
                                 }
-                                DispatchError::SendData(err) => warn!("{:?}", err),
+                                DispatchError::SendData(err) => {
+                                    tracing::warn!("Send data error: {err:?}");
+                                }
                                 DispatchError::ResponseBody(err) => {
-                                    error!("Response payload stream error: {:?}", err)
+                                    tracing::error!("Response payload stream error: {err:?}");
                                 }
                             }
                         }
                     });
                 }
                 Poll::Ready(None) => return Poll::Ready(Ok(())),
+
                 Poll::Pending => match this.ping_pong.as_mut() {
                     Some(ping_pong) => loop {
-                        if ping_pong.on_flight {
-                            // When have on flight ping pong. poll pong and and keep alive timer.
-                            // on success pong received update keep alive timer to determine the next timing of
-                            // ping pong.
+                        if ping_pong.in_flight {
+                            // When there is an in-flight ping-pong, poll pong and and keep-alive
+                            // timer. On successful pong received, update keep-alive timer to
+                            // determine the next timing of ping pong.
                             match ping_pong.ping_pong.poll_pong(cx)? {
                                 Poll::Ready(_) => {
-                                    ping_pong.on_flight = false;
+                                    ping_pong.in_flight = false;
 
-                                    let dead_line = this.config.keep_alive_expire().unwrap();
-                                    ping_pong.timer.as_mut().reset(dead_line);
+                                    let dead_line = this.config.keep_alive_deadline().unwrap();
+                                    ping_pong.timer.as_mut().reset(dead_line.into());
                                 }
                                 Poll::Pending => {
-                                    return ping_pong.timer.as_mut().poll(cx).map(|_| Ok(()))
+                                    return ping_pong.timer.as_mut().poll(cx).map(|_| Ok(()));
                                 }
                             }
                         } else {
-                            // When there is no on flight ping pong. keep alive timer is used to wait for next
-                            // timing of ping pong. Therefore at this point it serves as an interval instead.
+                            // When there is no in-flight ping-pong, keep-alive timer is used to
+                            // wait for next timing of ping-pong. Therefore, at this point it serves
+                            // as an interval instead.
                             ready!(ping_pong.timer.as_mut().poll(cx));
 
                             ping_pong.ping_pong.send_ping(Ping::opaque())?;
 
-                            let dead_line = this.config.keep_alive_expire().unwrap();
-                            ping_pong.timer.as_mut().reset(dead_line);
+                            let dead_line = this.config.keep_alive_deadline().unwrap();
+                            ping_pong.timer.as_mut().reset(dead_line.into());
 
-                            ping_pong.on_flight = true;
+                            ping_pong.in_flight = true;
                         }
                     },
                     None => return Poll::Pending,
@@ -197,6 +208,7 @@ async fn handle_response<B>(
     res: Response<B>,
     mut tx: SendResponse<Bytes>,
     config: ServiceConfig,
+    head_req: bool,
 ) -> Result<(), DispatchError>
 where
     B: MessageBody,
@@ -206,20 +218,20 @@ where
     // prepare response.
     let mut size = body.size();
     let res = prepare_response(config, res.head(), &mut size);
-    let eof = size.is_eof();
+    let eof_or_head = size.is_eof() || head_req;
 
     // send response head and return on eof.
     let mut stream = tx
-        .send_response(res, eof)
+        .send_response(res, eof_or_head)
         .map_err(DispatchError::SendResponse)?;
 
-    if eof {
+    if eof_or_head {
         return Ok(());
     }
 
-    // poll response body and send chunks to client
-    actix_rt::pin!(body);
+    let mut body = pin!(body);
 
+    // poll response body and send chunks to client
     while let Some(res) = poll_fn(|cx| body.as_mut().poll_next(cx)).await {
         let mut chunk = res.map_err(|err| DispatchError::ResponseBody(err.into()))?;
 
@@ -285,12 +297,14 @@ fn prepare_response(
         _ => {}
     }
 
-    let _ = match size {
-        BodySize::None | BodySize::Stream => None,
+    match size {
+        BodySize::None | BodySize::Stream => {}
 
-        BodySize::Sized(0) => res
-            .headers_mut()
-            .insert(CONTENT_LENGTH, HeaderValue::from_static("0")),
+        BodySize::Sized(0) => {
+            #[allow(clippy::declare_interior_mutable_const)]
+            const HV_ZERO: HeaderValue = HeaderValue::from_static("0");
+            res.headers_mut().insert(CONTENT_LENGTH, HV_ZERO);
+        }
 
         BodySize::Sized(len) => {
             let mut buf = itoa::Buffer::new();
@@ -298,19 +312,28 @@ fn prepare_response(
             res.headers_mut().insert(
                 CONTENT_LENGTH,
                 HeaderValue::from_str(buf.format(*len)).unwrap(),
-            )
+            );
         }
     };
 
     // copy headers
     for (key, value) in head.headers.iter() {
-        match *key {
-            // TODO: consider skipping other headers according to:
-            //       https://datatracker.ietf.org/doc/html/rfc7540#section-8.1.2.2
-            // omit HTTP/1.x only headers
-            CONNECTION | TRANSFER_ENCODING => continue,
-            CONTENT_LENGTH if skip_len => continue,
-            DATE => has_date = true,
+        match key {
+            // omit HTTP/1.x only headers according to:
+            // https://datatracker.ietf.org/doc/html/rfc7540#section-8.1.2.2
+            &CONNECTION | &TRANSFER_ENCODING | &UPGRADE => continue,
+
+            &CONTENT_LENGTH if skip_len => continue,
+            &DATE => has_date = true,
+
+            // omit HTTP/1.x only headers according to:
+            // https://datatracker.ietf.org/doc/html/rfc7540#section-8.1.2.2
+            hdr if hdr == HeaderName::from_static("keep-alive")
+                || hdr == HeaderName::from_static("proxy-connection") =>
+            {
+                continue
+            }
+
             _ => {}
         }
 
@@ -320,7 +343,7 @@ fn prepare_response(
     // set date header
     if !has_date {
         let mut bytes = BytesMut::with_capacity(29);
-        config.set_date_header(&mut bytes);
+        config.write_date_header_value(&mut bytes);
         res.headers_mut().insert(
             DATE,
             // SAFETY: serialized date-times are known ASCII strings

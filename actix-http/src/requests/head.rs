@@ -16,7 +16,10 @@ pub struct RequestHead {
     pub uri: Uri,
     pub version: Version,
     pub headers: HeaderMap,
+
+    /// Will only be None when called in unit tests unless set manually.
     pub peer_addr: Option<net::SocketAddr>,
+
     flags: Flags,
 }
 
@@ -130,8 +133,8 @@ impl RequestHead {
         }
     }
 
+    /// Request contains `EXPECT` header.
     #[inline]
-    /// Request contains `EXPECT` header
     pub fn expect(&self) -> bool {
         self.flags.contains(Flags::EXPECT)
     }
@@ -142,8 +145,8 @@ impl RequestHead {
     }
 }
 
-#[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum RequestHeadType {
     Owned(RequestHead),
     Rc(Rc<RequestHead>, Option<HeaderMap>),

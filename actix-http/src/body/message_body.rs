@@ -14,8 +14,44 @@ use pin_project_lite::pin_project;
 
 use super::{BodySize, BoxBody};
 
-/// An interface types that can converted to bytes and used as response bodies.
-// TODO: examples
+/// An interface for types that can be used as a response body.
+///
+/// It is not usually necessary to create custom body types, this trait is already [implemented for
+/// a large number of sensible body types](#foreign-impls) including:
+/// - Empty body: `()`
+/// - Text-based: `String`, `&'static str`, [`ByteString`](https://docs.rs/bytestring/1).
+/// - Byte-based: `Bytes`, `BytesMut`, `Vec<u8>`, `&'static [u8]`;
+/// - Streams: [`BodyStream`](super::BodyStream), [`SizedStream`](super::SizedStream)
+///
+/// # Examples
+/// ```
+/// # use std::convert::Infallible;
+/// # use std::task::{Poll, Context};
+/// # use std::pin::Pin;
+/// # use bytes::Bytes;
+/// # use actix_http::body::{BodySize, MessageBody};
+/// struct Repeat {
+///     chunk: String,
+///     n_times: usize,
+/// }
+///
+/// impl MessageBody for Repeat {
+///     type Error = Infallible;
+///
+///     fn size(&self) -> BodySize {
+///         BodySize::Sized((self.chunk.len() * self.n_times) as u64)
+///     }
+///
+///     fn poll_next(
+///         self: Pin<&mut Self>,
+///         _cx: &mut Context<'_>,
+///     ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+///         let payload_string = self.chunk.repeat(self.n_times);
+///         let payload_bytes = Bytes::from(payload_string);
+///         Poll::Ready(Some(Ok(payload_bytes)))
+///     }
+/// }
+/// ```
 pub trait MessageBody {
     /// The type of error that will be returned if streaming body fails.
     ///
@@ -29,7 +65,22 @@ pub trait MessageBody {
     fn size(&self) -> BodySize;
 
     /// Attempt to pull out the next chunk of body bytes.
-    // TODO: expand documentation
+    ///
+    /// # Return Value
+    /// Similar to the `Stream` interface, there are several possible return values, each indicating
+    /// a distinct state:
+    /// - `Poll::Pending` means that this body's next chunk is not ready yet. Implementations must
+    ///   ensure that the current task will be notified when the next chunk may be ready.
+    /// - `Poll::Ready(Some(val))` means that the body has successfully produced a chunk, `val`,
+    ///   and may produce further values on subsequent `poll_next` calls.
+    /// - `Poll::Ready(None)` means that the body is complete, and `poll_next` should not be
+    ///   invoked again.
+    ///
+    /// # Panics
+    /// Once a body is complete (i.e., `poll_next` returned `Ready(None)`), calling its `poll_next`
+    /// method again may panic, block forever, or cause other kinds of problems; this trait places
+    /// no requirements on the effects of such a call. However, as the `poll_next` method is not
+    /// marked unsafe, Rust’s usual rules apply: calls must never cause UB, regardless of its state.
     fn poll_next(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -37,7 +88,7 @@ pub trait MessageBody {
 
     /// Try to convert into the complete chunk of body bytes.
     ///
-    /// Implement this method if the entire body can be trivially extracted. This is useful for
+    /// Override this method if the complete body can be trivially extracted. This is useful for
     /// optimizations where `poll_next` calls can be avoided.
     ///
     /// Body types with [`BodySize::None`] are allowed to return empty `Bytes`. Although, if calling
@@ -54,7 +105,11 @@ pub trait MessageBody {
         Err(self)
     }
 
-    /// Converts this body into `BoxBody`.
+    /// Wraps this body into a `BoxBody`.
+    ///
+    /// No-op when called on a `BoxBody`, meaning there is no risk of double boxing when calling
+    /// this on a generic `MessageBody`. Prefer this over [`BoxBody::new`] when a boxed body
+    /// is required.
     #[inline]
     fn boxed(self) -> BoxBody
     where
@@ -65,7 +120,27 @@ pub trait MessageBody {
 }
 
 mod foreign_impls {
+    use std::{borrow::Cow, ops::DerefMut};
+
     use super::*;
+
+    impl<B> MessageBody for &mut B
+    where
+        B: MessageBody + Unpin + ?Sized,
+    {
+        type Error = B::Error;
+
+        fn size(&self) -> BodySize {
+            (**self).size()
+        }
+
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+            Pin::new(&mut **self).poll_next(cx)
+        }
+    }
 
     impl MessageBody for Infallible {
         type Error = Infallible;
@@ -124,8 +199,9 @@ mod foreign_impls {
         }
     }
 
-    impl<B> MessageBody for Pin<Box<B>>
+    impl<T, B> MessageBody for Pin<T>
     where
+        T: DerefMut<Target = B> + Unpin,
         B: MessageBody + ?Sized,
     {
         type Error = B::Error;
@@ -248,6 +324,39 @@ mod foreign_impls {
         }
     }
 
+    impl MessageBody for Cow<'static, [u8]> {
+        type Error = Infallible;
+
+        #[inline]
+        fn size(&self) -> BodySize {
+            BodySize::Sized(self.len() as u64)
+        }
+
+        #[inline]
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+            if self.is_empty() {
+                Poll::Ready(None)
+            } else {
+                let bytes = match mem::take(self.get_mut()) {
+                    Cow::Borrowed(b) => Bytes::from_static(b),
+                    Cow::Owned(b) => Bytes::from(b),
+                };
+                Poll::Ready(Some(Ok(bytes)))
+            }
+        }
+
+        #[inline]
+        fn try_into_bytes(self) -> Result<Bytes, Self> {
+            match self {
+                Cow::Borrowed(b) => Ok(Bytes::from_static(b)),
+                Cow::Owned(b) => Ok(Bytes::from(b)),
+            }
+        }
+    }
+
     impl MessageBody for &'static str {
         type Error = Infallible;
 
@@ -300,6 +409,39 @@ mod foreign_impls {
         #[inline]
         fn try_into_bytes(self) -> Result<Bytes, Self> {
             Ok(Bytes::from(self))
+        }
+    }
+
+    impl MessageBody for Cow<'static, str> {
+        type Error = Infallible;
+
+        #[inline]
+        fn size(&self) -> BodySize {
+            BodySize::Sized(self.len() as u64)
+        }
+
+        #[inline]
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, Self::Error>>> {
+            if self.is_empty() {
+                Poll::Ready(None)
+            } else {
+                let bytes = match mem::take(self.get_mut()) {
+                    Cow::Borrowed(s) => Bytes::from_static(s.as_bytes()),
+                    Cow::Owned(s) => Bytes::from(s.into_bytes()),
+                };
+                Poll::Ready(Some(Ok(bytes)))
+            }
+        }
+
+        #[inline]
+        fn try_into_bytes(self) -> Result<Bytes, Self> {
+            match self {
+                Cow::Borrowed(s) => Ok(Bytes::from_static(s.as_bytes())),
+                Cow::Owned(s) => Ok(Bytes::from(s.into_bytes())),
+            }
         }
     }
 
@@ -389,7 +531,7 @@ where
 mod tests {
     use actix_rt::pin;
     use actix_utils::future::poll_fn;
-    use bytes::{Bytes, BytesMut};
+    use futures_util::stream;
 
     use super::*;
     use crate::body::{self, EitherBody};
@@ -412,6 +554,7 @@ mod tests {
         };
     }
 
+    #[allow(unused_allocation)] // triggered by `Box::new(()).size()`
     #[actix_rt::test]
     async fn boxing_equivalence() {
         assert_eq!(().size(), BodySize::Sized(0));
@@ -426,6 +569,35 @@ mod tests {
         assert_poll_next_none!(pl);
     }
 
+    #[actix_rt::test]
+    async fn mut_equivalence() {
+        assert_eq!(().size(), BodySize::Sized(0));
+        assert_eq!(().size(), (&(&mut ())).size());
+
+        let pl = &mut ();
+        pin!(pl);
+        assert_poll_next_none!(pl);
+
+        let pl = &mut Box::new(());
+        pin!(pl);
+        assert_poll_next_none!(pl);
+
+        let mut body = body::SizedStream::new(
+            8,
+            stream::iter([
+                Ok::<_, std::io::Error>(Bytes::from("1234")),
+                Ok(Bytes::from("5678")),
+            ]),
+        );
+        let body = &mut body;
+        assert_eq!(body.size(), BodySize::Sized(8));
+        pin!(body);
+        assert_poll_next!(body, Bytes::from_static(b"1234"));
+        assert_poll_next!(body, Bytes::from_static(b"5678"));
+        assert_poll_next_none!(body);
+    }
+
+    #[allow(clippy::let_unit_value)]
     #[actix_rt::test]
     async fn test_unit() {
         let pl = ();
@@ -550,5 +722,19 @@ mod tests {
         assert_eq!(body, "hello cast!");
         let not_body = resp_body.downcast_ref::<()>();
         assert!(not_body.is_none());
+    }
+
+    #[actix_rt::test]
+    async fn non_owning_to_bytes() {
+        let mut body = BoxBody::new(());
+        let bytes = body::to_bytes(&mut body).await.unwrap();
+        assert_eq!(bytes, Bytes::new());
+
+        let mut body = body::BodyStream::new(stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from("1234")),
+            Ok(Bytes::from("5678")),
+        ]));
+        let bytes = body::to_bytes(&mut body).await.unwrap();
+        assert_eq!(bytes, Bytes::from_static(b"12345678"));
     }
 }

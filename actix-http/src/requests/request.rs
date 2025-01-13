@@ -10,8 +10,7 @@ use std::{
 use http::{header, Method, Uri, Version};
 
 use crate::{
-    header::HeaderMap, BoxedPayloadStream, Extensions, HttpMessage, Message, Payload,
-    RequestHead,
+    header::HeaderMap, BoxedPayloadStream, Extensions, HttpMessage, Message, Payload, RequestHead,
 };
 
 /// An HTTP request.
@@ -19,7 +18,7 @@ pub struct Request<P = BoxedPayloadStream> {
     pub(crate) payload: Payload<P>,
     pub(crate) head: Message<RequestHead>,
     pub(crate) conn_data: Option<Rc<Extensions>>,
-    pub(crate) req_data: RefCell<Extensions>,
+    pub(crate) extensions: RefCell<Extensions>,
 }
 
 impl<P> HttpMessage for Request<P> {
@@ -34,16 +33,14 @@ impl<P> HttpMessage for Request<P> {
         mem::replace(&mut self.payload, Payload::None)
     }
 
-    /// Request extensions
     #[inline]
     fn extensions(&self) -> Ref<'_, Extensions> {
-        self.req_data.borrow()
+        self.extensions.borrow()
     }
 
-    /// Mutable reference to a the request's extensions
     #[inline]
     fn extensions_mut(&self) -> RefMut<'_, Extensions> {
-        self.req_data.borrow_mut()
+        self.extensions.borrow_mut()
     }
 }
 
@@ -52,7 +49,7 @@ impl From<Message<RequestHead>> for Request<BoxedPayloadStream> {
         Request {
             head,
             payload: Payload::None,
-            req_data: RefCell::new(Extensions::default()),
+            extensions: RefCell::new(Extensions::default()),
             conn_data: None,
         }
     }
@@ -65,7 +62,7 @@ impl Request<BoxedPayloadStream> {
         Request {
             head: Message::new(),
             payload: Payload::None,
-            req_data: RefCell::new(Extensions::default()),
+            extensions: RefCell::new(Extensions::default()),
             conn_data: None,
         }
     }
@@ -77,7 +74,7 @@ impl<P> Request<P> {
         Request {
             payload,
             head: Message::new(),
-            req_data: RefCell::new(Extensions::default()),
+            extensions: RefCell::new(Extensions::default()),
             conn_data: None,
         }
     }
@@ -90,7 +87,7 @@ impl<P> Request<P> {
             Request {
                 payload,
                 head: self.head,
-                req_data: self.req_data,
+                extensions: self.extensions,
                 conn_data: self.conn_data,
             },
             pl,
@@ -115,14 +112,14 @@ impl<P> Request<P> {
     #[inline]
     /// Http message part of the request
     pub fn head(&self) -> &RequestHead {
-        &*self.head
+        &self.head
     }
 
     #[inline]
     #[doc(hidden)]
     /// Mutable reference to a HTTP message part of the request
     pub fn head_mut(&mut self) -> &mut RequestHead {
-        &mut *self.head
+        &mut self.head
     }
 
     /// Mutable reference to the message's headers.
@@ -176,7 +173,7 @@ impl<P> Request<P> {
     /// Peer address is the directly connected peer's socket address. If a proxy is used in front of
     /// the Actix Web server, then it would be address of this proxy.
     ///
-    /// Will only return None when called in unit tests.
+    /// Will only return None when called in unit tests unless set manually.
     #[inline]
     pub fn peer_addr(&self) -> Option<net::SocketAddr> {
         self.head().peer_addr
@@ -195,16 +192,17 @@ impl<P> Request<P> {
             .and_then(|container| container.get::<T>())
     }
 
-    /// Returns the connection data container if an [on-connect] callback was registered.
+    /// Returns the connection-level data/extensions container if an [on-connect] callback was
+    /// registered, leaving an empty one in its place.
     ///
     /// [on-connect]: crate::HttpServiceBuilder::on_connect_ext
     pub fn take_conn_data(&mut self) -> Option<Rc<Extensions>> {
         self.conn_data.take()
     }
 
-    /// Returns the request data container, leaving an empty one in it's place.
+    /// Returns the request-local data/extensions container, leaving an empty one in its place.
     pub fn take_req_data(&mut self) -> Extensions {
-        mem::take(self.req_data.get_mut())
+        mem::take(self.extensions.get_mut())
     }
 }
 
@@ -235,7 +233,6 @@ impl<P> fmt::Debug for Request<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::TryFrom;
 
     #[test]
     fn test_basics() {

@@ -1,10 +1,10 @@
 use actix_http::HttpService;
 use actix_server::Server;
 use actix_service::map_config;
-use actix_web::{dev::AppConfig, get, App};
+use actix_web::{dev::AppConfig, get, App, Responder};
 
 #[get("/")]
-async fn index() -> &'static str {
+async fn index() -> impl Responder {
     "Hello, world. From Actix Web!"
 }
 
@@ -18,7 +18,8 @@ async fn main() -> std::io::Result<()> {
             HttpService::build()
                 // pass the app to service builder
                 // map_config is used to map App's configuration to ServiceBuilder
-                .finish(map_config(app, |_| AppConfig::default()))
+                // h1 will configure server to only use HTTP/1.1
+                .h1(map_config(app, |_| AppConfig::default()))
                 .tcp()
         })?
         .run()
