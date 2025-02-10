@@ -1,8 +1,7 @@
-use std::{cmp, convert::TryFrom as _, fmt, str};
-
-use crate::error::ParseError;
+use std::{cmp, fmt, str};
 
 use super::Quality;
+use crate::error::ParseError;
 
 /// Represents an item with a quality value as defined
 /// in [RFC 7231 §5.3.1](https://datatracker.ietf.org/doc/html/rfc7231#section-5.3.1).
@@ -31,7 +30,7 @@ use super::Quality;
 /// let q_item_fallback: QualityItem<String> = "abc;q=0.1".parse().unwrap();
 /// assert!(q_item > q_item_fallback);
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QualityItem<T> {
     /// The wrapped contents of the field.
     pub item: T,
@@ -53,9 +52,14 @@ impl<T> QualityItem<T> {
         Self::new(item, Quality::MAX)
     }
 
-    /// Constructs a new `QualityItem` from an item, using the minimum q-value.
+    /// Constructs a new `QualityItem` from an item, using the minimum, non-zero q-value.
     pub fn min(item: T) -> Self {
         Self::new(item, Quality::MIN)
+    }
+
+    /// Constructs a new `QualityItem` from an item, using zero q-value of zero.
+    pub fn zero(item: T) -> Self {
+        Self::new(item, Quality::ZERO)
     }
 }
 
@@ -73,7 +77,10 @@ impl<T: fmt::Display> fmt::Display for QualityItem<T> {
             // q-factor value is implied for max value
             Quality::MAX => Ok(()),
 
-            Quality::MIN => f.write_str("; q=0"),
+            // fast path for zero
+            Quality::ZERO => f.write_str("; q=0"),
+
+            // quality formatting is already using itoa
             q => write!(f, "; q={}", q),
         }
     }
@@ -139,7 +146,7 @@ mod tests {
 
     // copy of encoding from actix-web headers
     #[allow(clippy::enum_variant_names)] // allow Encoding prefix on EncodingExt
-    #[derive(Clone, PartialEq, Debug)]
+    #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Encoding {
         Chunked,
         Brotli,

@@ -9,20 +9,15 @@ use std::{
 
 use actix_rt::task::{spawn_blocking, JoinHandle};
 use bytes::Bytes;
-use futures_core::{ready, Stream};
-
-#[cfg(feature = "compress-brotli")]
-use brotli2::write::BrotliDecoder;
-
 #[cfg(feature = "compress-gzip")]
 use flate2::write::{GzDecoder, ZlibDecoder};
-
+use futures_core::{ready, Stream};
 #[cfg(feature = "compress-zstd")]
 use zstd::stream::write::Decoder as ZstdDecoder;
 
 use crate::{
     encoding::Writer,
-    error::{BlockingError, PayloadError},
+    error::PayloadError,
     header::{ContentEncoding, HeaderMap, CONTENT_ENCODING},
 };
 
@@ -47,17 +42,20 @@ where
     pub fn new(stream: S, encoding: ContentEncoding) -> Decoder<S> {
         let decoder = match encoding {
             #[cfg(feature = "compress-brotli")]
-            ContentEncoding::Br => Some(ContentDecoder::Br(Box::new(BrotliDecoder::new(
+            ContentEncoding::Brotli => Some(ContentDecoder::Brotli(Box::new(
+                brotli::DecompressorWriter::new(Writer::new(), 8_096),
+            ))),
+
+            #[cfg(feature = "compress-gzip")]
+            ContentEncoding::Deflate => Some(ContentDecoder::Deflate(Box::new(ZlibDecoder::new(
                 Writer::new(),
             )))),
-            #[cfg(feature = "compress-gzip")]
-            ContentEncoding::Deflate => Some(ContentDecoder::Deflate(Box::new(
-                ZlibDecoder::new(Writer::new()),
-            ))),
+
             #[cfg(feature = "compress-gzip")]
             ContentEncoding::Gzip => Some(ContentDecoder::Gzip(Box::new(GzDecoder::new(
                 Writer::new(),
             )))),
+
             #[cfg(feature = "compress-zstd")]
             ContentEncoding::Zstd => Some(ContentDecoder::Zstd(Box::new(
                 ZstdDecoder::new(Writer::new()).expect(
@@ -101,8 +99,12 @@ where
 
         loop {
             if let Some(ref mut fut) = this.fut {
-                let (chunk, decoder) =
-                    ready!(Pin::new(fut).poll(cx)).map_err(|_| BlockingError)??;
+                let (chunk, decoder) = ready!(Pin::new(fut).poll(cx)).map_err(|_| {
+                    PayloadError::Io(io::Error::new(
+                        io::ErrorKind::Other,
+                        "Blocking task was cancelled unexpectedly",
+                    ))
+                })??;
 
                 *this.decoder = Some(decoder);
                 this.fut.take();
@@ -162,10 +164,13 @@ where
 enum ContentDecoder {
     #[cfg(feature = "compress-gzip")]
     Deflate(Box<ZlibDecoder<Writer>>),
+
     #[cfg(feature = "compress-gzip")]
     Gzip(Box<GzDecoder<Writer>>),
+
     #[cfg(feature = "compress-brotli")]
-    Br(Box<BrotliDecoder<Writer>>),
+    Brotli(Box<brotli::DecompressorWriter<Writer>>),
+
     // We need explicit 'static lifetime here because ZstdDecoder need lifetime
     // argument, and we use `spawn_blocking` in `Decoder::poll_next` that require `FnOnce() -> R + Send + 'static`
     #[cfg(feature = "compress-zstd")]
@@ -176,7 +181,7 @@ impl ContentDecoder {
     fn feed_eof(&mut self) -> io::Result<Option<Bytes>> {
         match self {
             #[cfg(feature = "compress-brotli")]
-            ContentDecoder::Br(ref mut decoder) => match decoder.flush() {
+            ContentDecoder::Brotli(ref mut decoder) => match decoder.flush() {
                 Ok(()) => {
                     let b = decoder.get_mut().take();
 
@@ -186,7 +191,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
 
             #[cfg(feature = "compress-gzip")]
@@ -200,7 +205,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
 
             #[cfg(feature = "compress-gzip")]
@@ -213,7 +218,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
 
             #[cfg(feature = "compress-zstd")]
@@ -226,7 +231,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
         }
     }
@@ -234,7 +239,7 @@ impl ContentDecoder {
     fn feed_data(&mut self, data: Bytes) -> io::Result<Option<Bytes>> {
         match self {
             #[cfg(feature = "compress-brotli")]
-            ContentDecoder::Br(ref mut decoder) => match decoder.write_all(&data) {
+            ContentDecoder::Brotli(ref mut decoder) => match decoder.write_all(&data) {
                 Ok(_) => {
                     decoder.flush()?;
                     let b = decoder.get_mut().take();
@@ -245,7 +250,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
 
             #[cfg(feature = "compress-gzip")]
@@ -260,7 +265,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
 
             #[cfg(feature = "compress-gzip")]
@@ -275,7 +280,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
 
             #[cfg(feature = "compress-zstd")]
@@ -290,7 +295,7 @@ impl ContentDecoder {
                         Ok(None)
                     }
                 }
-                Err(e) => Err(e),
+                Err(err) => Err(err),
             },
         }
     }

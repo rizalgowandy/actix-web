@@ -1,8 +1,63 @@
 //! Websocket integration.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use actix::{Actor, StreamHandler};
+//! use actix_web::{get, web, App, Error, HttpRequest, HttpResponse, HttpServer};
+//! use actix_web_actors::ws;
+//!
+//! /// Define Websocket actor
+//! struct MyWs;
+//!
+//! impl Actor for MyWs {
+//!     type Context = ws::WebsocketContext<Self>;
+//! }
+//!
+//! /// Handler for ws::Message message
+//! impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for MyWs {
+//!     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
+//!         match msg {
+//!             Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
+//!             Ok(ws::Message::Text(text)) => ctx.text(text),
+//!             Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
+//!             _ => (),
+//!         }
+//!     }
+//! }
+//!
+//! #[get("/ws")]
+//! async fn websocket(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+//!     ws::start(MyWs, &req, stream)
+//! }
+//!
+//! const MAX_FRAME_SIZE: usize = 16_384; // 16KiB
+//!
+//! #[get("/custom-ws")]
+//! async fn custom_websocket(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+//!     // Create a Websocket session with a specific max frame size, and protocols.
+//!     ws::WsResponseBuilder::new(MyWs, &req, stream)
+//!         .frame_size(MAX_FRAME_SIZE)
+//!         .protocols(&["A", "B"])
+//!         .start()
+//! }
+//!
+//! #[actix_web::main]
+//! async fn main() -> std::io::Result<()> {
+//!     HttpServer::new(|| {
+//!             App::new()
+//!                 .service(websocket)
+//!                 .service(custom_websocket)
+//!         })
+//!         .bind(("127.0.0.1", 8080))?
+//!         .run()
+//!         .await
+//! }
+//! ```
+//!
 
 use std::{
     collections::VecDeque,
-    convert::TryFrom,
     future::Future,
     io, mem,
     pin::Pin,
@@ -11,18 +66,14 @@ use std::{
 
 use actix::{
     dev::{
-        AsyncContextParts, ContextFut, ContextParts, Envelope, Mailbox, StreamHandler,
-        ToEnvelope,
+        AsyncContextParts, ContextFut, ContextParts, Envelope, Mailbox, StreamHandler, ToEnvelope,
     },
     fut::ActorFuture,
     Actor, ActorContext, ActorState, Addr, AsyncContext, Handler, Message as ActixMessage,
     SpawnHandle,
 };
-use actix_codec::{Decoder as _, Encoder as _};
 use actix_http::ws::{hash_key, Codec};
-pub use actix_http::ws::{
-    CloseCode, CloseReason, Frame, HandshakeError, Message, ProtocolError,
-};
+pub use actix_http::ws::{CloseCode, CloseReason, Frame, HandshakeError, Message, ProtocolError};
 use actix_web::{
     error::{Error, PayloadError},
     http::{
@@ -36,25 +87,57 @@ use bytestring::ByteString;
 use futures_core::Stream;
 use pin_project_lite::pin_project;
 use tokio::sync::oneshot;
+use tokio_util::codec::{Decoder as _, Encoder as _};
 
 /// Builder for Websocket session response.
 ///
 /// # Examples
 ///
-/// Create a Websocket session response with default configuration.
-/// ```ignore
-/// WsResponseBuilder::new(WsActor, &req, stream).start()
-/// ```
+/// ```no_run
+/// # use actix::{Actor, StreamHandler};
+/// # use actix_web::{get, web, App, Error, HttpRequest, HttpResponse, HttpServer};
+/// # use actix_web_actors::ws;
+/// #
+/// # struct MyWs;
+/// #
+/// # impl Actor for MyWs {
+/// #     type Context = ws::WebsocketContext<Self>;
+/// # }
+/// #
+/// # /// Handler for ws::Message message
+/// # impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for MyWs {
+/// #     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {}
+/// # }
+/// #
+/// #[get("/ws")]
+/// async fn websocket(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+///     ws::WsResponseBuilder::new(MyWs, &req, stream).start()
+/// }
 ///
-/// Create a Websocket session with a specific max frame size, [`Codec`], and protocols.
-/// ```ignore
 /// const MAX_FRAME_SIZE: usize = 16_384; // 16KiB
 ///
-/// ws::WsResponseBuilder::new(WsActor, &req, stream)
-///     .codec(Codec::new())
-///     .protocols(&["A", "B"])
-///     .frame_size(MAX_FRAME_SIZE)
-///     .start()
+/// #[get("/custom-ws")]
+/// async fn custom_websocket(req: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+///     // Create a Websocket session with a specific max frame size, codec, and protocols.
+///     ws::WsResponseBuilder::new(MyWs, &req, stream)
+///         .codec(actix_http::ws::Codec::new())
+///         // This will overwrite the codec's max frame-size
+///         .frame_size(MAX_FRAME_SIZE)
+///         .protocols(&["A", "B"])
+///         .start()
+/// }
+/// #
+/// # #[actix_web::main]
+/// # async fn main() -> std::io::Result<()> {
+/// #     HttpServer::new(|| {
+/// #             App::new()
+/// #                 .service(websocket)
+/// #                 .service(custom_websocket)
+/// #         })
+/// #         .bind(("127.0.0.1", 8080))?
+/// #         .run()
+/// #         .await
+/// # }
 /// ```
 pub struct WsResponseBuilder<'a, A, T>
 where
@@ -340,16 +423,16 @@ pub fn handshake_with_protocols(
     };
 
     // check requested protocols
-    let protocol =
-        req.headers()
-            .get(&header::SEC_WEBSOCKET_PROTOCOL)
-            .and_then(|req_protocols| {
-                let req_protocols = req_protocols.to_str().ok()?;
-                req_protocols
-                    .split(',')
-                    .map(|req_p| req_p.trim())
-                    .find(|req_p| protocols.iter().any(|p| p == req_p))
-            });
+    let protocol = req
+        .headers()
+        .get(&header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|req_protocols| {
+            let req_protocols = req_protocols.to_str().ok()?;
+            req_protocols
+                .split(',')
+                .map(|req_p| req_p.trim())
+                .find(|req_p| protocols.iter().any(|p| p == req_p))
+        });
 
     let mut response = HttpResponse::build(StatusCode::SWITCHING_PROTOCOLS)
         .upgrade("websocket")
@@ -627,7 +710,7 @@ where
         }
 
         if !this.buf.is_empty() {
-            Poll::Ready(Some(Ok(this.buf.split().freeze())))
+            Poll::Ready(Some(Ok(std::mem::take(&mut this.buf).freeze())))
         } else if this.fut.alive() && !this.closed {
             Poll::Pending
         } else {
@@ -692,10 +775,10 @@ where
                         break;
                     }
                     Poll::Pending => break,
-                    Poll::Ready(Some(Err(e))) => {
+                    Poll::Ready(Some(Err(err))) => {
                         return Poll::Ready(Some(Err(ProtocolError::Io(io::Error::new(
                             io::ErrorKind::Other,
-                            format!("{}", e),
+                            format!("{err}"),
                         )))));
                     }
                 }
@@ -713,11 +796,8 @@ where
             Some(frm) => {
                 let msg = match frm {
                     Frame::Text(data) => {
-                        Message::Text(ByteString::try_from(data).map_err(|e| {
-                            ProtocolError::Io(io::Error::new(
-                                io::ErrorKind::Other,
-                                format!("{}", e),
-                            ))
+                        Message::Text(ByteString::try_from(data).map_err(|err| {
+                            ProtocolError::Io(io::Error::new(io::ErrorKind::Other, err))
                         })?)
                     }
                     Frame::Binary(data) => Message::Binary(data),
@@ -734,10 +814,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use actix_web::{
-        http::{header, Method},
-        test::TestRequest,
-    };
+    use actix_web::test::TestRequest;
 
     use super::*;
 

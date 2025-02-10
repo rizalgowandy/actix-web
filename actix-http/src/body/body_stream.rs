@@ -47,9 +47,8 @@ where
 
     /// Attempts to pull out the next value of the underlying [`Stream`].
     ///
-    /// Empty values are skipped to prevent [`BodyStream`]'s transmission being
-    /// ended on a zero-length chunk, but rather proceed until the underlying
-    /// [`Stream`] ends.
+    /// Empty values are skipped to prevent [`BodyStream`]'s transmission being ended on a
+    /// zero-length chunk, but rather proceed until the underlying [`Stream`] ends.
     fn poll_next(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -80,7 +79,7 @@ mod tests {
     use futures_core::ready;
     use futures_util::{stream, FutureExt as _};
     use pin_project_lite::pin_project;
-    use static_assertions::{assert_impl_all, assert_not_impl_all};
+    use static_assertions::{assert_impl_all, assert_not_impl_any};
 
     use super::*;
     use crate::body::to_bytes;
@@ -91,10 +90,10 @@ mod tests {
     assert_impl_all!(BodyStream<stream::Empty<Result<Bytes, Infallible>>>: MessageBody);
     assert_impl_all!(BodyStream<stream::Repeat<Result<Bytes, Infallible>>>: MessageBody);
 
-    assert_not_impl_all!(BodyStream<stream::Empty<Bytes>>: MessageBody);
-    assert_not_impl_all!(BodyStream<stream::Repeat<Bytes>>: MessageBody);
+    assert_not_impl_any!(BodyStream<stream::Empty<Bytes>>: MessageBody);
+    assert_not_impl_any!(BodyStream<stream::Repeat<Bytes>>: MessageBody);
     // crate::Error is not Clone
-    assert_not_impl_all!(BodyStream<stream::Repeat<Result<Bytes, crate::Error>>>: MessageBody);
+    assert_not_impl_any!(BodyStream<stream::Repeat<Result<Bytes, crate::Error>>>: MessageBody);
 
     #[actix_rt::test]
     async fn skips_empty_chunks() {
@@ -132,7 +131,7 @@ mod tests {
         assert_eq!(to_bytes(body).await.ok(), Some(Bytes::from("12")));
     }
     #[derive(Debug, Display, Error)]
-    #[display(fmt = "stream error")]
+    #[display("stream error")]
     struct StreamErr;
 
     #[actix_rt::test]

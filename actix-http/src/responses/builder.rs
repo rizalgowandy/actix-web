@@ -1,9 +1,6 @@
 //! HTTP response builder.
 
-use std::{
-    cell::{Ref, RefMut},
-    fmt, str,
-};
+use std::{cell::RefCell, fmt, str};
 
 use crate::{
     body::{EitherBody, MessageBody},
@@ -96,7 +93,7 @@ impl ResponseBuilder {
                 Ok((key, value)) => {
                     parts.headers.insert(key, value);
                 }
-                Err(e) => self.err = Some(e.into()),
+                Err(err) => self.err = Some(err.into()),
             };
         }
 
@@ -122,7 +119,7 @@ impl ResponseBuilder {
         if let Some(parts) = self.inner() {
             match header.try_into_pair() {
                 Ok((key, value)) => parts.headers.append(key, value),
-                Err(e) => self.err = Some(e.into()),
+                Err(err) => self.err = Some(err.into()),
             };
         }
 
@@ -147,7 +144,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Set connection type to Upgrade
+    /// Set connection type to `Upgrade`.
     #[inline]
     pub fn upgrade<V>(&mut self, value: V) -> &mut Self
     where
@@ -164,7 +161,7 @@ impl ResponseBuilder {
         self
     }
 
-    /// Force close connection, even if it is marked as keep-alive
+    /// Force-close connection, even if it is marked as keep-alive.
     #[inline]
     pub fn force_close(&mut self) -> &mut Self {
         if let Some(parts) = self.inner() {
@@ -196,24 +193,10 @@ impl ResponseBuilder {
                 Ok(value) => {
                     parts.headers.insert(header::CONTENT_TYPE, value);
                 }
-                Err(e) => self.err = Some(e.into()),
+                Err(err) => self.err = Some(err.into()),
             };
         }
         self
-    }
-
-    /// Responses extensions
-    #[inline]
-    pub fn extensions(&self) -> Ref<'_, Extensions> {
-        let head = self.head.as_ref().expect("cannot reuse response builder");
-        head.extensions.borrow()
-    }
-
-    /// Mutable reference to a the response's extensions
-    #[inline]
-    pub fn extensions_mut(&mut self) -> RefMut<'_, Extensions> {
-        let head = self.head.as_ref().expect("cannot reuse response builder");
-        head.extensions.borrow_mut()
     }
 
     /// Generate response with a wrapped body.
@@ -238,7 +221,12 @@ impl ResponseBuilder {
         }
 
         let head = self.head.take().expect("cannot reuse response builder");
-        Ok(Response { head, body })
+
+        Ok(Response {
+            head,
+            body,
+            extensions: RefCell::new(Extensions::new()),
+        })
     }
 
     /// Generate response with an empty body.
@@ -363,12 +351,9 @@ mod tests {
         assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "text/plain");
 
         let resp = Response::build(StatusCode::OK)
-            .content_type(mime::APPLICATION_JAVASCRIPT_UTF_8)
+            .content_type(mime::TEXT_JAVASCRIPT)
             .body(Bytes::new());
-        assert_eq!(
-            resp.headers().get(CONTENT_TYPE).unwrap(),
-            "application/javascript; charset=utf-8"
-        );
+        assert_eq!(resp.headers().get(CONTENT_TYPE).unwrap(), "text/javascript");
     }
 
     #[test]

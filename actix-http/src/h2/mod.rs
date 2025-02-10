@@ -7,7 +7,7 @@ use std::{
 };
 
 use actix_codec::{AsyncRead, AsyncWrite};
-use actix_rt::time::Sleep;
+use actix_rt::time::{sleep_until, Sleep};
 use bytes::Bytes;
 use futures_core::{ready, Stream};
 use h2::{
@@ -15,16 +15,15 @@ use h2::{
     RecvStream,
 };
 
-mod dispatcher;
-mod service;
-
-pub use self::dispatcher::Dispatcher;
-pub use self::service::H2Service;
-
 use crate::{
     config::ServiceConfig,
     error::{DispatchError, PayloadError},
 };
+
+mod dispatcher;
+mod service;
+
+pub use self::{dispatcher::Dispatcher, service::H2Service};
 
 /// HTTP/2 peer stream.
 pub struct Payload {
@@ -58,16 +57,15 @@ impl Stream for Payload {
     }
 }
 
-pub(crate) fn handshake_with_timeout<T>(
-    io: T,
-    config: &ServiceConfig,
-) -> HandshakeWithTimeout<T>
+pub(crate) fn handshake_with_timeout<T>(io: T, config: &ServiceConfig) -> HandshakeWithTimeout<T>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     HandshakeWithTimeout {
         handshake: handshake(io),
-        timer: config.client_timer().map(Box::pin),
+        timer: config
+            .client_request_deadline()
+            .map(|deadline| Box::pin(sleep_until(deadline.into()))),
     }
 }
 
@@ -86,7 +84,7 @@ where
         let this = self.get_mut();
 
         match Pin::new(&mut this.handshake).poll(cx)? {
-            // return the timer on success handshake. It can be re-used for h2 ping-pong.
+            // return the timer on success handshake; its slot can be re-used for h2 ping-pong
             Poll::Ready(conn) => Poll::Ready(Ok((conn, this.timer.take()))),
             Poll::Pending => match this.timer.as_mut() {
                 Some(timer) => {
@@ -101,11 +99,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::panic::{RefUnwindSafe, UnwindSafe};
-
     use static_assertions::assert_impl_all;
 
     use super::*;
 
-    assert_impl_all!(Payload: Unpin, Send, Sync, UnwindSafe, RefUnwindSafe);
+    assert_impl_all!(Payload: Unpin, Send, Sync);
 }

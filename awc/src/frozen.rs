@@ -1,22 +1,23 @@
-use std::{convert::TryFrom, net, rc::Rc, time::Duration};
+use std::{net, rc::Rc, time::Duration};
 
+use actix_http::{
+    body::MessageBody,
+    error::HttpError,
+    header::{HeaderMap, TryIntoHeaderPair},
+    Method, RequestHead, Uri,
+};
 use bytes::Bytes;
 use futures_core::Stream;
 use serde::Serialize;
 
-use actix_http::{
-    error::HttpError,
-    header::{HeaderMap, HeaderName, TryIntoHeaderValue},
-    Method, RequestHead, Uri,
-};
-
 use crate::{
-    any_body::AnyBody,
+    client::ClientConfig,
     sender::{RequestSender, SendClientRequest},
-    BoxError, ClientConfig,
+    BoxError,
 };
 
 /// `FrozenClientRequest` struct represents cloneable client request.
+///
 /// It could be used to send same request multiple times.
 #[derive(Clone)]
 pub struct FrozenClientRequest {
@@ -46,9 +47,9 @@ impl FrozenClientRequest {
     /// Send a body.
     pub fn send_body<B>(&self, body: B) -> SendClientRequest
     where
-        B: Into<AnyBody>,
+        B: MessageBody + 'static,
     {
-        RequestSender::Rc(self.head.clone(), None).send_body(
+        RequestSender::Rc(Rc::clone(&self.head), None).send_body(
             self.addr,
             self.response_decompress,
             self.timeout,
@@ -59,7 +60,7 @@ impl FrozenClientRequest {
 
     /// Send a json body.
     pub fn send_json<T: Serialize>(&self, value: &T) -> SendClientRequest {
-        RequestSender::Rc(self.head.clone(), None).send_json(
+        RequestSender::Rc(Rc::clone(&self.head), None).send_json(
             self.addr,
             self.response_decompress,
             self.timeout,
@@ -70,7 +71,7 @@ impl FrozenClientRequest {
 
     /// Send an urlencoded body.
     pub fn send_form<T: Serialize>(&self, value: &T) -> SendClientRequest {
-        RequestSender::Rc(self.head.clone(), None).send_form(
+        RequestSender::Rc(Rc::clone(&self.head), None).send_form(
             self.addr,
             self.response_decompress,
             self.timeout,
@@ -82,10 +83,10 @@ impl FrozenClientRequest {
     /// Send a streaming body.
     pub fn send_stream<S, E>(&self, stream: S) -> SendClientRequest
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin + 'static,
+        S: Stream<Item = Result<Bytes, E>> + 'static,
         E: Into<BoxError> + 'static,
     {
-        RequestSender::Rc(self.head.clone(), None).send_stream(
+        RequestSender::Rc(Rc::clone(&self.head), None).send_stream(
             self.addr,
             self.response_decompress,
             self.timeout,
@@ -96,7 +97,7 @@ impl FrozenClientRequest {
 
     /// Send an empty body.
     pub fn send(&self) -> SendClientRequest {
-        RequestSender::Rc(self.head.clone(), None).send(
+        RequestSender::Rc(Rc::clone(&self.head), None).send(
             self.addr,
             self.response_decompress,
             self.timeout,
@@ -104,20 +105,14 @@ impl FrozenClientRequest {
         )
     }
 
-    /// Create a `FrozenSendBuilder` with extra headers
+    /// Clones this `FrozenClientRequest`, returning a new one with extra headers added.
     pub fn extra_headers(&self, extra_headers: HeaderMap) -> FrozenSendBuilder {
         FrozenSendBuilder::new(self.clone(), extra_headers)
     }
 
-    /// Create a `FrozenSendBuilder` with an extra header
-    pub fn extra_header<K, V>(&self, key: K, value: V) -> FrozenSendBuilder
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
-        V: TryIntoHeaderValue,
-    {
-        self.extra_headers(HeaderMap::new())
-            .extra_header(key, value)
+    /// Clones this `FrozenClientRequest`, returning a new one with the extra header added.
+    pub fn extra_header(&self, header: impl TryIntoHeaderPair) -> FrozenSendBuilder {
+        self.extra_headers(HeaderMap::new()).extra_header(header)
     }
 }
 
@@ -138,31 +133,22 @@ impl FrozenSendBuilder {
     }
 
     /// Insert a header, it overrides existing header in `FrozenClientRequest`.
-    pub fn extra_header<K, V>(mut self, key: K, value: V) -> Self
-    where
-        HeaderName: TryFrom<K>,
-        <HeaderName as TryFrom<K>>::Error: Into<HttpError>,
-        V: TryIntoHeaderValue,
-    {
-        match HeaderName::try_from(key) {
-            Ok(key) => match value.try_into_value() {
-                Ok(value) => {
-                    self.extra_headers.insert(key, value);
-                }
-                Err(e) => self.err = Some(e.into()),
-            },
-            Err(e) => self.err = Some(e.into()),
+    pub fn extra_header(mut self, header: impl TryIntoHeaderPair) -> Self {
+        match header.try_into_pair() {
+            Ok((key, value)) => {
+                self.extra_headers.insert(key, value);
+            }
+
+            Err(err) => self.err = Some(err.into()),
         }
+
         self
     }
 
     /// Complete request construction and send a body.
-    pub fn send_body<B>(self, body: B) -> SendClientRequest
-    where
-        B: Into<AnyBody>,
-    {
-        if let Some(e) = self.err {
-            return e.into();
+    pub fn send_body(self, body: impl MessageBody + 'static) -> SendClientRequest {
+        if let Some(err) = self.err {
+            return err.into();
         }
 
         RequestSender::Rc(self.req.head, Some(self.extra_headers)).send_body(
@@ -175,9 +161,9 @@ impl FrozenSendBuilder {
     }
 
     /// Complete request construction and send a json body.
-    pub fn send_json<T: Serialize>(self, value: &T) -> SendClientRequest {
-        if let Some(e) = self.err {
-            return e.into();
+    pub fn send_json(self, value: impl Serialize) -> SendClientRequest {
+        if let Some(err) = self.err {
+            return err.into();
         }
 
         RequestSender::Rc(self.req.head, Some(self.extra_headers)).send_json(
@@ -190,9 +176,9 @@ impl FrozenSendBuilder {
     }
 
     /// Complete request construction and send an urlencoded body.
-    pub fn send_form<T: Serialize>(self, value: &T) -> SendClientRequest {
-        if let Some(e) = self.err {
-            return e.into();
+    pub fn send_form(self, value: impl Serialize) -> SendClientRequest {
+        if let Some(err) = self.err {
+            return err.into();
         }
 
         RequestSender::Rc(self.req.head, Some(self.extra_headers)).send_form(
@@ -207,11 +193,11 @@ impl FrozenSendBuilder {
     /// Complete request construction and send a streaming body.
     pub fn send_stream<S, E>(self, stream: S) -> SendClientRequest
     where
-        S: Stream<Item = Result<Bytes, E>> + Unpin + 'static,
+        S: Stream<Item = Result<Bytes, E>> + 'static,
         E: Into<BoxError> + 'static,
     {
-        if let Some(e) = self.err {
-            return e.into();
+        if let Some(err) = self.err {
+            return err.into();
         }
 
         RequestSender::Rc(self.req.head, Some(self.extra_headers)).send_stream(
@@ -225,8 +211,8 @@ impl FrozenSendBuilder {
 
     /// Complete request construction and send an empty body.
     pub fn send(self) -> SendClientRequest {
-        if let Some(e) = self.err {
-            return e.into();
+        if let Some(err) = self.err {
+            return err.into();
         }
 
         RequestSender::Rc(self.req.head, Some(self.extra_headers)).send(

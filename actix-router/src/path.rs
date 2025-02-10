@@ -1,8 +1,9 @@
-use std::borrow::Cow;
-use std::ops::Index;
+use std::{
+    borrow::Cow,
+    ops::{DerefMut, Index},
+};
 
-use firestorm::profile_method;
-use serde::de;
+use serde::{de, Deserialize};
 
 use crate::{de::PathDeserializer, Resource, ResourcePath};
 
@@ -23,8 +24,13 @@ impl Default for PathItem {
 /// If resource path contains variable patterns, `Path` stores them.
 #[derive(Debug, Clone, Default)]
 pub struct Path<T> {
+    /// Full path representation.
     path: T,
+
+    /// Number of characters in `path` that have been processed into `segments`.
     pub(crate) skip: u16,
+
+    /// List of processed dynamic segments; name->value pairs.
     pub(crate) segments: Vec<(Cow<'static, str>, PathItem)>,
 }
 
@@ -37,23 +43,39 @@ impl<T: ResourcePath> Path<T> {
         }
     }
 
-    /// Get reference to inner path instance.
+    /// Returns reference to inner path instance.
     #[inline]
     pub fn get_ref(&self) -> &T {
         &self.path
     }
 
-    /// Get mutable reference to inner path instance.
+    /// Returns mutable reference to inner path instance.
     #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.path
     }
 
-    /// Path.
+    /// Returns full path as a string.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self.path.path()
+    }
+
+    /// Returns unprocessed part of the path.
+    ///
+    /// Returns empty string if no more is to be processed.
+    #[inline]
+    pub fn unprocessed(&self) -> &str {
+        // clamp skip to path length
+        let skip = (self.skip as usize).min(self.as_str().len());
+        &self.path.path()[skip..]
+    }
+
+    /// Returns unprocessed part of the path.
+    #[doc(hidden)]
+    #[deprecated(since = "0.6.0", note = "Use `.as_str()` or `.unprocessed()`.")]
     #[inline]
     pub fn path(&self) -> &str {
-        profile_method!(path);
-
         let skip = self.skip as usize;
         let path = self.path.path();
         if skip <= path.len() {
@@ -66,8 +88,8 @@ impl<T: ResourcePath> Path<T> {
     /// Set new path.
     #[inline]
     pub fn set(&mut self, path: T) {
-        self.skip = 0;
         self.path = path;
+        self.skip = 0;
         self.segments.clear();
     }
 
@@ -85,10 +107,8 @@ impl<T: ResourcePath> Path<T> {
     }
 
     pub(crate) fn add(&mut self, name: impl Into<Cow<'static, str>>, value: PathItem) {
-        profile_method!(add);
-
         match value {
-            PathItem::Static(s) => self.segments.push((name.into(), PathItem::Static(s))),
+            PathItem::Static(seg) => self.segments.push((name.into(), PathItem::Static(seg))),
             PathItem::Segment(begin, end) => self.segments.push((
                 name.into(),
                 PathItem::Segment(self.skip + begin, self.skip + end),
@@ -120,14 +140,12 @@ impl<T: ResourcePath> Path<T> {
 
     /// Get matched parameter by name without type conversion
     pub fn get(&self, name: &str) -> Option<&str> {
-        profile_method!(get);
-
         for (seg_name, val) in self.segments.iter() {
             if name == seg_name {
                 return match val {
-                    PathItem::Static(ref s) => Some(s),
-                    PathItem::Segment(s, e) => {
-                        Some(&self.path.path()[(*s as usize)..(*e as usize)])
+                    PathItem::Static(ref seg) => Some(seg),
+                    PathItem::Segment(start, end) => {
+                        Some(&self.path.path()[(*start as usize)..(*end as usize)])
                     }
                 };
             }
@@ -136,22 +154,11 @@ impl<T: ResourcePath> Path<T> {
         None
     }
 
-    /// Get unprocessed part of the path
-    pub fn unprocessed(&self) -> &str {
-        &self.path.path()[(self.skip as usize)..]
-    }
-
-    /// Get matched parameter by name.
+    /// Returns matched parameter by name.
     ///
     /// If keyed parameter is not available empty string is used as default value.
     pub fn query(&self, key: &str) -> &str {
-        profile_method!(query);
-
-        if let Some(s) = self.get(key) {
-            s
-        } else {
-            ""
-        }
+        self.get(key).unwrap_or_default()
     }
 
     /// Return iterator to items in parameter container.
@@ -162,10 +169,13 @@ impl<T: ResourcePath> Path<T> {
         }
     }
 
-    /// Try to deserialize matching parameters to a specified type `U`
-    pub fn load<'de, U: serde::Deserialize<'de>>(&'de self) -> Result<U, de::value::Error> {
-        profile_method!(load);
-        de::Deserialize::deserialize(PathDeserializer::new(self))
+    /// Deserializes matching parameters to a specified type `U`.
+    ///
+    /// # Errors
+    ///
+    /// Returns error when dynamic path segments cannot be deserialized into a `U` type.
+    pub fn load<'de, U: Deserialize<'de>>(&'de self) -> Result<U, de::value::Error> {
+        Deserialize::deserialize(PathDeserializer::new(self))
     }
 }
 
@@ -183,8 +193,10 @@ impl<'a, T: ResourcePath> Iterator for PathIter<'a, T> {
         if self.idx < self.params.segment_count() {
             let idx = self.idx;
             let res = match self.params.segments[idx].1 {
-                PathItem::Static(ref s) => s,
-                PathItem::Segment(s, e) => &self.params.path.path()[(s as usize)..(e as usize)],
+                PathItem::Static(ref seg) => seg,
+                PathItem::Segment(start, end) => {
+                    &self.params.path.path()[(start as usize)..(end as usize)]
+                }
             };
             self.idx += 1;
             return Some((&self.params.segments[idx].0, res));
@@ -207,14 +219,45 @@ impl<T: ResourcePath> Index<usize> for Path<T> {
 
     fn index(&self, idx: usize) -> &str {
         match self.segments[idx].1 {
-            PathItem::Static(ref s) => s,
-            PathItem::Segment(s, e) => &self.path.path()[(s as usize)..(e as usize)],
+            PathItem::Static(ref seg) => seg,
+            PathItem::Segment(start, end) => &self.path.path()[(start as usize)..(end as usize)],
         }
     }
 }
 
-impl<T: ResourcePath> Resource<T> for Path<T> {
-    fn resource_path(&mut self) -> &mut Self {
+impl<T: ResourcePath> Resource for Path<T> {
+    type Path = T;
+
+    fn resource_path(&mut self) -> &mut Path<Self::Path> {
         self
+    }
+}
+
+impl<T, P> Resource for T
+where
+    T: DerefMut<Target = Path<P>>,
+    P: ResourcePath,
+{
+    type Path = P;
+
+    fn resource_path(&mut self) -> &mut Path<Self::Path> {
+        &mut *self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[allow(clippy::needless_borrow)]
+    #[test]
+    fn deref_impls() {
+        let mut foo = Path::new("/foo");
+        let _ = (&mut foo).resource_path();
+
+        let foo = RefCell::new(foo);
+        let _ = foo.borrow_mut().resource_path();
     }
 }

@@ -3,11 +3,10 @@
 use std::{error::Error as StdError, fmt, io, str::Utf8Error, string::FromUtf8Error};
 
 use derive_more::{Display, Error, From};
+pub use http::{status::InvalidStatusCode, Error as HttpError};
 use http::{uri::InvalidUri, StatusCode};
 
-use crate::{body::BoxBody, ws, Response};
-
-pub use http::Error as HttpError;
+use crate::{body::BoxBody, Response};
 
 pub struct Error {
     inner: Box<ErrorInner>,
@@ -51,7 +50,7 @@ impl Error {
         Self::new(Kind::SendResponse)
     }
 
-    #[allow(unused)] // reserved for future use (TODO: remove allow when being used)
+    #[allow(unused)] // available for future use
     pub(crate) fn new_io() -> Self {
         Self::new(Kind::Io)
     }
@@ -61,6 +60,7 @@ impl Error {
         Self::new(Kind::Encoder)
     }
 
+    #[allow(unused)] // used with `ws` feature flag
     pub(crate) fn new_ws() -> Self {
         Self::new(Kind::Ws)
     }
@@ -80,35 +80,37 @@ impl From<Error> for Response<BoxBody> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Display)]
 pub(crate) enum Kind {
-    #[display(fmt = "error processing HTTP")]
+    #[display("error processing HTTP")]
     Http,
 
-    #[display(fmt = "error parsing HTTP message")]
+    #[display("error parsing HTTP message")]
     Parse,
 
-    #[display(fmt = "request payload read error")]
+    #[display("request payload read error")]
     Payload,
 
-    #[display(fmt = "response body write error")]
+    #[display("response body write error")]
     Body,
 
-    #[display(fmt = "send response error")]
+    #[display("send response error")]
     SendResponse,
 
-    #[display(fmt = "error in WebSocket process")]
+    #[display("error in WebSocket process")]
     Ws,
 
-    #[display(fmt = "connection error")]
+    #[display("connection error")]
     Io,
 
-    #[display(fmt = "encoder error")]
+    #[display("encoder error")]
     Encoder,
 }
 
 impl fmt::Debug for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // TODO: more detail
-        f.write_str("actix_http::Error")
+        f.debug_struct("actix_http::Error")
+            .field("kind", &self.inner.kind)
+            .field("cause", &self.inner.cause)
+            .finish()
     }
 }
 
@@ -139,14 +141,16 @@ impl From<HttpError> for Error {
     }
 }
 
-impl From<ws::HandshakeError> for Error {
-    fn from(err: ws::HandshakeError) -> Self {
+#[cfg(feature = "ws")]
+impl From<crate::ws::HandshakeError> for Error {
+    fn from(err: crate::ws::HandshakeError) -> Self {
         Self::new_ws().with_cause(err)
     }
 }
 
-impl From<ws::ProtocolError> for Error {
-    fn from(err: ws::ProtocolError) -> Self {
+#[cfg(feature = "ws")]
+impl From<crate::ws::ProtocolError> for Error {
+    fn from(err: crate::ws::ProtocolError) -> Self {
         Self::new_ws().with_cause(err)
     }
 }
@@ -156,44 +160,44 @@ impl From<ws::ProtocolError> for Error {
 #[non_exhaustive]
 pub enum ParseError {
     /// An invalid `Method`, such as `GE.T`.
-    #[display(fmt = "Invalid Method specified")]
+    #[display("invalid method specified")]
     Method,
 
     /// An invalid `Uri`, such as `exam ple.domain`.
-    #[display(fmt = "Uri error: {}", _0)]
+    #[display("URI error: {}", _0)]
     Uri(InvalidUri),
 
     /// An invalid `HttpVersion`, such as `HTP/1.1`
-    #[display(fmt = "Invalid HTTP version specified")]
+    #[display("invalid HTTP version specified")]
     Version,
 
     /// An invalid `Header`.
-    #[display(fmt = "Invalid Header provided")]
+    #[display("invalid Header provided")]
     Header,
 
     /// A message head is too large to be reasonable.
-    #[display(fmt = "Message head is too large")]
+    #[display("message head is too large")]
     TooLarge,
 
     /// A message reached EOF, but is not complete.
-    #[display(fmt = "Message is incomplete")]
+    #[display("message is incomplete")]
     Incomplete,
 
     /// An invalid `Status`, such as `1337 ELITE`.
-    #[display(fmt = "Invalid Status provided")]
+    #[display("invalid status provided")]
     Status,
 
     /// A timeout occurred waiting for an IO event.
     #[allow(dead_code)]
-    #[display(fmt = "Timeout")]
+    #[display("timeout")]
     Timeout,
 
-    /// An `io::Error` that occurred while trying to read or write to a network stream.
-    #[display(fmt = "IO error: {}", _0)]
+    /// An I/O error that occurred while trying to read or write to a network stream.
+    #[display("I/O error: {}", _0)]
     Io(io::Error),
 
     /// Parsing a field as string failed.
-    #[display(fmt = "UTF8 error: {}", _0)]
+    #[display("UTF-8 error: {}", _0)]
     Utf8(Utf8Error),
 }
 
@@ -247,40 +251,33 @@ impl From<ParseError> for Response<BoxBody> {
     }
 }
 
-/// A set of errors that can occur running blocking tasks in thread pool.
-#[derive(Debug, Display, Error)]
-#[display(fmt = "Blocking thread pool is gone")]
-pub struct BlockingError;
-
 /// A set of errors that can occur during payload parsing.
 #[derive(Debug, Display)]
 #[non_exhaustive]
 pub enum PayloadError {
     /// A payload reached EOF, but is not complete.
-    #[display(
-        fmt = "A payload reached EOF, but is not complete. Inner error: {:?}",
-        _0
-    )]
+    #[display("payload reached EOF before completing: {:?}", _0)]
     Incomplete(Option<io::Error>),
 
     /// Content encoding stream corruption.
-    #[display(fmt = "Can not decode content-encoding.")]
+    #[display("can not decode content-encoding")]
     EncodingCorrupted,
 
     /// Payload reached size limit.
-    #[display(fmt = "Payload reached size limit.")]
+    #[display("payload reached size limit")]
     Overflow,
 
     /// Payload length is unknown.
-    #[display(fmt = "Payload length is unknown.")]
+    #[display("payload length is unknown")]
     UnknownLength,
 
     /// HTTP/2 payload error.
-    #[display(fmt = "{}", _0)]
-    Http2Payload(h2::Error),
+    #[cfg(feature = "http2")]
+    #[display("{}", _0)]
+    Http2Payload(::h2::Error),
 
     /// Generic I/O error.
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
     Io(io::Error),
 }
 
@@ -288,18 +285,20 @@ impl std::error::Error for PayloadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             PayloadError::Incomplete(None) => None,
-            PayloadError::Incomplete(Some(err)) => Some(err as &dyn std::error::Error),
+            PayloadError::Incomplete(Some(err)) => Some(err),
             PayloadError::EncodingCorrupted => None,
             PayloadError::Overflow => None,
             PayloadError::UnknownLength => None,
-            PayloadError::Http2Payload(err) => Some(err as &dyn std::error::Error),
-            PayloadError::Io(err) => Some(err as &dyn std::error::Error),
+            #[cfg(feature = "http2")]
+            PayloadError::Http2Payload(err) => Some(err),
+            PayloadError::Io(err) => Some(err),
         }
     }
 }
 
-impl From<h2::Error> for PayloadError {
-    fn from(err: h2::Error) -> Self {
+#[cfg(feature = "http2")]
+impl From<::h2::Error> for PayloadError {
+    fn from(err: ::h2::Error) -> Self {
         PayloadError::Http2Payload(err)
     }
 }
@@ -316,15 +315,6 @@ impl From<io::Error> for PayloadError {
     }
 }
 
-impl From<BlockingError> for PayloadError {
-    fn from(_: BlockingError) -> Self {
-        PayloadError::Io(io::Error::new(
-            io::ErrorKind::Other,
-            "Operation is canceled",
-        ))
-    }
-}
-
 impl From<PayloadError> for Error {
     fn from(err: PayloadError) -> Self {
         Self::new_payload().with_cause(err)
@@ -333,52 +323,61 @@ impl From<PayloadError> for Error {
 
 /// A set of errors that can occur during dispatching HTTP requests.
 #[derive(Debug, Display, From)]
+#[non_exhaustive]
 pub enum DispatchError {
     /// Service error.
-    #[display(fmt = "Service Error")]
+    #[display("service error")]
     Service(Response<BoxBody>),
 
     /// Body streaming error.
-    #[display(fmt = "Body error: {}", _0)]
+    #[display("body error: {}", _0)]
     Body(Box<dyn StdError>),
 
     /// Upgrade service error.
+    #[display("upgrade error")]
     Upgrade,
 
     /// An `io::Error` that occurred while trying to read or write to a network stream.
-    #[display(fmt = "IO error: {}", _0)]
+    #[display("I/O error: {}", _0)]
     Io(io::Error),
 
     /// Request parse error.
-    #[display(fmt = "Request parse error: {}", _0)]
+    #[display("request parse error: {}", _0)]
     Parse(ParseError),
 
     /// HTTP/2 error.
-    #[display(fmt = "{}", _0)]
+    #[display("{}", _0)]
+    #[cfg(feature = "http2")]
     H2(h2::Error),
 
     /// The first request did not complete within the specified timeout.
-    #[display(fmt = "The first request did not complete within the specified timeout")]
+    #[display("request did not complete within the specified timeout")]
     SlowRequestTimeout,
 
-    /// Disconnect timeout. Makes sense for ssl streams.
-    #[display(fmt = "Connection shutdown timeout")]
+    /// Disconnect timeout. Makes sense for TLS streams.
+    #[display("connection shutdown timeout")]
     DisconnectTimeout,
 
+    /// Handler dropped payload before reading EOF.
+    #[display("handler dropped payload before reading EOF")]
+    HandlerDroppedPayload,
+
     /// Internal error.
-    #[display(fmt = "Internal error")]
+    #[display("internal error")]
     InternalError,
 }
 
 impl StdError for DispatchError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            // TODO: error source extraction?
             DispatchError::Service(_res) => None,
             DispatchError::Body(err) => Some(&**err),
             DispatchError::Io(err) => Some(err),
             DispatchError::Parse(err) => Some(err),
+
+            #[cfg(feature = "http2")]
             DispatchError::H2(err) => Some(err),
+
             _ => None,
         }
     }
@@ -386,38 +385,23 @@ impl StdError for DispatchError {
 
 /// A set of error that can occur during parsing content type.
 #[derive(Debug, Display, Error)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 #[non_exhaustive]
 pub enum ContentTypeError {
-    /// Can not parse content type
-    #[display(fmt = "Can not parse content type")]
+    /// Can not parse content type.
+    #[display("could not parse content type")]
     ParseError,
 
-    /// Unknown content encoding
-    #[display(fmt = "Unknown content encoding")]
+    /// Unknown content encoding.
+    #[display("unknown content encoding")]
     UnknownEncoding,
 }
 
 #[cfg(test)]
-mod content_type_test_impls {
-    use super::*;
-
-    impl std::cmp::PartialEq for ContentTypeError {
-        fn eq(&self, other: &Self) -> bool {
-            match self {
-                Self::ParseError => matches!(other, ContentTypeError::ParseError),
-                Self::UnknownEncoding => {
-                    matches!(other, ContentTypeError::UnknownEncoding)
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
+    use http::Error as HttpError;
+
     use super::*;
-    use http::{Error as HttpError, StatusCode};
-    use std::io;
 
     #[test]
     fn test_into_response() {
@@ -435,7 +419,7 @@ mod tests {
         let err: Error = ParseError::Io(orig).into();
         assert_eq!(
             format!("{}", err),
-            "error parsing HTTP message: IO error: other"
+            "error parsing HTTP message: I/O error: other"
         );
     }
 
@@ -462,7 +446,7 @@ mod tests {
         let err = PayloadError::Incomplete(None);
         assert_eq!(
             err.to_string(),
-            "A payload reached EOF, but is not complete. Inner error: None"
+            "payload reached EOF before completing: None"
         );
     }
 
@@ -482,7 +466,7 @@ mod tests {
             match ParseError::from($from) {
                 e @ $error => {
                     let desc = format!("{}", e);
-                    assert_eq!(desc, format!("IO error: {}", $from));
+                    assert_eq!(desc, format!("I/O error: {}", $from));
                 }
                 _ => unreachable!("{:?}", $from),
             }

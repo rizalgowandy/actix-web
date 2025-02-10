@@ -1,7 +1,7 @@
-use std::{
-    convert::{From, Into},
-    fmt,
-};
+use std::fmt;
+
+use base64::prelude::*;
+use tracing::error;
 
 /// Operation codes defined in [RFC 6455 §11.8].
 ///
@@ -58,7 +58,7 @@ impl From<OpCode> for u8 {
             Ping => 9,
             Pong => 10,
             Bad => {
-                log::error!("Attempted to convert invalid opcode to u8. This is a bug.");
+                error!("Attempted to convert invalid opcode to u8. This is a bug.");
                 8 // if this somehow happens, a close frame will help us tear down quickly
             }
         }
@@ -242,7 +242,7 @@ pub fn hash_key(key: &[u8]) -> [u8; 28] {
     };
 
     let mut hash_b64 = [0; 28];
-    let n = base64::encode_config_slice(&hash, base64::STANDARD, &mut hash_b64);
+    let n = BASE64_STANDARD.encode_slice(hash, &mut hash_b64).unwrap();
     assert_eq!(n, 28);
 
     hash_b64

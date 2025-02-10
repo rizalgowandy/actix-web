@@ -7,6 +7,8 @@ use std::{
 };
 
 use actix_web::{error::Error, web::Bytes};
+#[cfg(feature = "experimental-io-uring")]
+use bytes::BytesMut;
 use futures_core::{ready, Stream};
 use pin_project_lite::pin_project;
 
@@ -78,7 +80,7 @@ async fn chunked_read_file_callback(
 ) -> Result<(File, Bytes), Error> {
     use io::{Read as _, Seek as _};
 
-    let res = actix_web::rt::task::spawn_blocking(move || {
+    let res = actix_web::web::block(move || {
         let mut buf = Vec::with_capacity(max_bytes);
 
         file.seek(io::SeekFrom::Start(offset))?;
@@ -91,8 +93,7 @@ async fn chunked_read_file_callback(
             Ok((file, Bytes::from(buf)))
         }
     })
-    .await
-    .map_err(|_| actix_web::error::BlockingError)??;
+    .await??;
 
     Ok(res)
 }
@@ -210,67 +211,6 @@ where
                 *this.counter += bytes.len() as u64;
 
                 Poll::Ready(Some(Ok(bytes)))
-            }
-        }
-    }
-}
-
-#[cfg(feature = "experimental-io-uring")]
-use bytes_mut::BytesMut;
-
-// TODO: remove new type and use bytes::BytesMut directly
-#[doc(hidden)]
-#[cfg(feature = "experimental-io-uring")]
-mod bytes_mut {
-    use std::ops::{Deref, DerefMut};
-
-    use tokio_uring::buf::{IoBuf, IoBufMut};
-
-    #[derive(Debug)]
-    pub struct BytesMut(bytes::BytesMut);
-
-    impl BytesMut {
-        pub(super) fn new() -> Self {
-            Self(bytes::BytesMut::new())
-        }
-    }
-
-    impl Deref for BytesMut {
-        type Target = bytes::BytesMut;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
-    impl DerefMut for BytesMut {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
-        }
-    }
-
-    unsafe impl IoBuf for BytesMut {
-        fn stable_ptr(&self) -> *const u8 {
-            self.0.as_ptr()
-        }
-
-        fn bytes_init(&self) -> usize {
-            self.0.len()
-        }
-
-        fn bytes_total(&self) -> usize {
-            self.0.capacity()
-        }
-    }
-
-    unsafe impl IoBufMut for BytesMut {
-        fn stable_mut_ptr(&mut self) -> *mut u8 {
-            self.0.as_mut_ptr()
-        }
-
-        unsafe fn set_init(&mut self, init_len: usize) {
-            if self.len() < init_len {
-                self.0.set_len(init_len);
             }
         }
     }

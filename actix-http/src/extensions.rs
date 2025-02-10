@@ -1,17 +1,38 @@
 use std::{
     any::{Any, TypeId},
+    collections::HashMap,
     fmt,
+    hash::{BuildHasherDefault, Hasher},
 };
 
-use ahash::AHashMap;
+/// A hasher for `TypeId`s that takes advantage of its known characteristics.
+///
+/// Author of `anymap` crate has done research on the topic:
+/// https://github.com/chris-morgan/anymap/blob/2e9a5704/src/lib.rs#L599
+#[derive(Debug, Default)]
+struct NoOpHasher(u64);
+
+impl Hasher for NoOpHasher {
+    fn write(&mut self, _bytes: &[u8]) {
+        unimplemented!("This NoOpHasher can only handle u64s")
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 
 /// A type map for request extensions.
 ///
 /// All entries into this map must be owned types (or static references).
 #[derive(Default)]
 pub struct Extensions {
-    /// Use AHasher with a std HashMap with for faster lookups on the small `TypeId` keys.
-    map: AHashMap<TypeId, Box<dyn Any>>,
+    // use no-op hasher with a std HashMap with for faster lookups on the small `TypeId` keys
+    map: HashMap<TypeId, Box<dyn Any>, BuildHasherDefault<NoOpHasher>>,
 }
 
 impl Extensions {
@@ -19,7 +40,7 @@ impl Extensions {
     #[inline]
     pub fn new() -> Extensions {
         Extensions {
-            map: AHashMap::new(),
+            map: HashMap::default(),
         }
     }
 
@@ -81,6 +102,46 @@ impl Extensions {
         self.map
             .get_mut(&TypeId::of::<T>())
             .and_then(|boxed| boxed.downcast_mut())
+    }
+
+    /// Inserts the given `value` into the extensions if it is not present, then returns a reference
+    /// to the value in the extensions.
+    ///
+    /// ```
+    /// # use actix_http::Extensions;
+    /// let mut map = Extensions::new();
+    /// assert_eq!(map.get::<Vec<u32>>(), None);
+    ///
+    /// map.get_or_insert(Vec::<u32>::new()).push(1);
+    /// assert_eq!(map.get::<Vec<u32>>(), Some(&vec![1]));
+    ///
+    /// map.get_or_insert(Vec::<u32>::new()).push(2);
+    /// assert_eq!(map.get::<Vec<u32>>(), Some(&vec![1,2]));
+    /// ```
+    pub fn get_or_insert<T: 'static>(&mut self, value: T) -> &mut T {
+        self.get_or_insert_with(|| value)
+    }
+
+    /// Inserts a value computed from `f` into the extensions if the given `value` is not present,
+    /// then returns a reference to the value in the extensions.
+    ///
+    /// ```
+    /// # use actix_http::Extensions;
+    /// let mut map = Extensions::new();
+    /// assert_eq!(map.get::<Vec<u32>>(), None);
+    ///
+    /// map.get_or_insert_with(Vec::<u32>::new).push(1);
+    /// assert_eq!(map.get::<Vec<u32>>(), Some(&vec![1]));
+    ///
+    /// map.get_or_insert_with(Vec::<u32>::new).push(2);
+    /// assert_eq!(map.get::<Vec<u32>>(), Some(&vec![1,2]));
+    /// ```
+    pub fn get_or_insert_with<T: 'static, F: FnOnce() -> T>(&mut self, default: F) -> &mut T {
+        self.map
+            .entry(TypeId::of::<T>())
+            .or_insert_with(|| Box::new(default()))
+            .downcast_mut()
+            .expect("extensions map should now contain a T value")
     }
 
     /// Remove an item from the map of a given type.

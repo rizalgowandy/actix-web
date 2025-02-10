@@ -1,9 +1,8 @@
 //! Various helpers for Actix applications to use during testing.
 
-#![deny(rust_2018_idioms, nonstandard_style)]
-#![warn(future_incompatible)]
 #![doc(html_logo_url = "https://actix.rs/img/logo.png")]
 #![doc(html_favicon_url = "https://actix.rs/favicon.ico")]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 #[cfg(feature = "openssl")]
 extern crate tls_openssl as openssl;
@@ -12,7 +11,7 @@ use std::{net, thread, time::Duration};
 
 use actix_codec::{AsyncRead, AsyncWrite, Framed};
 use actix_rt::{net::TcpStream, System};
-use actix_server::{Server, ServiceFactory};
+use actix_server::{Server, ServerServiceFactory};
 use awc::{
     error::PayloadError, http::header::HeaderMap, ws, Client, ClientRequest, ClientResponse,
     Connector,
@@ -29,35 +28,39 @@ use tokio::sync::mpsc;
 /// for HTTP applications.
 ///
 /// # Examples
-/// ```no_run
-/// use actix_http::HttpService;
+///
+/// ```
+/// use actix_http::{HttpService, Response, Error, StatusCode};
 /// use actix_http_test::test_server;
-/// use actix_web::{web, App, HttpResponse, Error};
+/// use actix_service::{fn_service, map_config, ServiceFactoryExt as _};
 ///
-/// async fn my_handler() -> Result<HttpResponse, Error> {
-///     Ok(HttpResponse::Ok().into())
-/// }
-///
-/// #[actix_web::test]
+/// #[actix_rt::test]
+/// # async fn hidden_test() {}
 /// async fn test_example() {
-///     let mut srv = TestServer::start(||
-///         HttpService::new(
-///             App::new().service(web::resource("/").to(my_handler))
-///         )
-///     );
+///     let srv = test_server(|| {
+///         HttpService::build()
+///             .h1(fn_service(|req| async move {
+///                 Ok::<_, Error>(Response::ok())
+///             }))
+///             .tcp()
+///             .map_err(|_| ())
+///     })
+///     .await;
 ///
 ///     let req = srv.get("/");
 ///     let response = req.send().await.unwrap();
-///     assert!(response.status().is_success());
+///
+///     assert_eq!(response.status(), StatusCode::OK);
 /// }
+/// # actix_rt::System::new().block_on(test_example());
 /// ```
-pub async fn test_server<F: ServiceFactory<TcpStream>>(factory: F) -> TestServer {
+pub async fn test_server<F: ServerServiceFactory<TcpStream>>(factory: F) -> TestServer {
     let tcp = net::TcpListener::bind("127.0.0.1:0").unwrap();
     test_server_with_addr(tcp, factory).await
 }
 
 /// Start [`test server`](test_server()) on an existing address binding.
-pub async fn test_server_with_addr<F: ServiceFactory<TcpStream>>(
+pub async fn test_server_with_addr<F: ServerServiceFactory<TcpStream>>(
     tcp: net::TcpListener,
     factory: F,
 ) -> TestServer {
@@ -87,6 +90,7 @@ pub async fn test_server_with_addr<F: ServiceFactory<TcpStream>>(
 
         // notify TestServer that server and system have shut down
         // all thread managed resources should be dropped at this point
+        #[allow(clippy::let_underscore_future)]
         let _ = thread_stop_tx.send(());
     });
 
@@ -102,7 +106,7 @@ pub async fn test_server_with_addr<F: ServiceFactory<TcpStream>>(
             builder.set_verify(SslVerifyMode::NONE);
             let _ = builder
                 .set_alpn_protos(b"\x02h2\x08http/1.1")
-                .map_err(|e| log::error!("Can not set alpn protocol: {:?}", e));
+                .map_err(|err| log::error!("Can not set ALPN protocol: {err}"));
 
             Connector::new()
                 .conn_lifetime(Duration::from_secs(0))
@@ -294,6 +298,7 @@ impl Drop for TestServer {
         // without needing to await anything
 
         // signal server to stop
+        #[allow(clippy::let_underscore_future)]
         let _ = self.server.stop(true);
 
         // signal system to stop

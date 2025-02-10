@@ -1,22 +1,20 @@
 use std::{
-    fmt,
     fs::Metadata,
     io,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use actix_service::{Service, ServiceFactory};
 use actix_web::{
     body::{self, BoxBody, SizedStream},
     dev::{
-        AppService, BodyEncoding, HttpServiceFactory, ResourceDef, ServiceRequest,
+        self, AppService, HttpServiceFactory, ResourceDef, Service, ServiceFactory, ServiceRequest,
         ServiceResponse,
     },
     http::{
         header::{
-            self, Charset, ContentDisposition, ContentEncoding, DispositionParam,
-            DispositionType, ExtendedValue,
+            self, Charset, ContentDisposition, ContentEncoding, DispositionParam, DispositionType,
+            ExtendedValue, HeaderValue,
         },
         StatusCode,
     },
@@ -25,11 +23,12 @@ use actix_web::{
 use bitflags::bitflags;
 use derive_more::{Deref, DerefMut};
 use futures_core::future::LocalBoxFuture;
-use mime_guess::from_path;
+use mime::Mime;
 
 use crate::{encoding::equiv_utf8_text, range::HttpRange};
 
 bitflags! {
+    #[derive(Debug, Clone, Copy)]
     pub(crate) struct Flags: u8 {
         const ETAG =                0b0000_0001;
         const LAST_MD =             0b0000_0010;
@@ -40,7 +39,7 @@ bitflags! {
 
 impl Default for Flags {
     fn default() -> Self {
-        Flags::from_bits_truncate(0b0000_0111)
+        Flags::from_bits_truncate(0b0000_1111)
     }
 }
 
@@ -68,49 +67,24 @@ impl Default for Flags {
 ///     NamedFile::open_async("./static/index.html").await
 /// }
 /// ```
-#[derive(Deref, DerefMut)]
+#[derive(Debug, Deref, DerefMut)]
 pub struct NamedFile {
-    path: PathBuf,
     #[deref]
     #[deref_mut]
     file: File,
+    path: PathBuf,
     modified: Option<SystemTime>,
     pub(crate) md: Metadata,
     pub(crate) flags: Flags,
     pub(crate) status_code: StatusCode,
-    pub(crate) content_type: mime::Mime,
-    pub(crate) content_disposition: header::ContentDisposition,
+    pub(crate) content_type: Mime,
+    pub(crate) content_disposition: ContentDisposition,
     pub(crate) encoding: Option<ContentEncoding>,
-}
-
-impl fmt::Debug for NamedFile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("NamedFile")
-            .field("path", &self.path)
-            .field(
-                "file",
-                #[cfg(feature = "experimental-io-uring")]
-                {
-                    &"tokio_uring::File"
-                },
-                #[cfg(not(feature = "experimental-io-uring"))]
-                {
-                    &self.file
-                },
-            )
-            .field("modified", &self.modified)
-            .field("md", &self.md)
-            .field("flags", &self.flags)
-            .field("status_code", &self.status_code)
-            .field("content_type", &self.content_type)
-            .field("content_disposition", &self.content_disposition)
-            .field("encoding", &self.encoding)
-            .finish()
-    }
 }
 
 #[cfg(not(feature = "experimental-io-uring"))]
 pub(crate) use std::fs::File;
+
 #[cfg(feature = "experimental-io-uring")]
 pub(crate) use tokio_uring::fs::File;
 
@@ -124,18 +98,18 @@ impl NamedFile {
     ///
     /// # Examples
     /// ```ignore
+    /// use std::{
+    ///     io::{self, Write as _},
+    ///     env,
+    ///     fs::File
+    /// };
     /// use actix_files::NamedFile;
-    /// use std::io::{self, Write};
-    /// use std::env;
-    /// use std::fs::File;
     ///
-    /// fn main() -> io::Result<()> {
-    ///     let mut file = File::create("foo.txt")?;
-    ///     file.write_all(b"Hello, world!")?;
-    ///     let named_file = NamedFile::from_file(file, "bar.txt")?;
-    ///     # std::fs::remove_file("foo.txt");
-    ///     Ok(())
-    /// }
+    /// let mut file = File::create("foo.txt")?;
+    /// file.write_all(b"Hello, world!")?;
+    /// let named_file = NamedFile::from_file(file, "bar.txt")?;
+    /// # std::fs::remove_file("foo.txt");
+    /// Ok(())
     /// ```
     pub fn from_file<P: AsRef<Path>>(file: File, path: P) -> io::Result<NamedFile> {
         let path = path.as_ref().to_path_buf();
@@ -153,20 +127,25 @@ impl NamedFile {
                 }
             };
 
-            let ct = from_path(&path).first_or_octet_stream();
+            let ct = mime_guess::from_path(&path).first_or_octet_stream();
 
             let disposition = match ct.type_() {
-                mime::IMAGE | mime::TEXT | mime::VIDEO => DispositionType::Inline,
+                mime::IMAGE | mime::TEXT | mime::AUDIO | mime::VIDEO => DispositionType::Inline,
                 mime::APPLICATION => match ct.subtype() {
                     mime::JAVASCRIPT | mime::JSON => DispositionType::Inline,
-                    name if name == "wasm" => DispositionType::Inline,
+                    name if name == "wasm" || name == "xhtml" => DispositionType::Inline,
                     _ => DispositionType::Attachment,
                 },
                 _ => DispositionType::Attachment,
             };
 
-            let mut parameters =
-                vec![DispositionParam::Filename(String::from(filename.as_ref()))];
+            // replace special characters in filenames which could occur on some filesystems
+            let filename_s = filename
+                .replace('\n', "%0A") // \n line break
+                .replace('\x0B', "%0B") // \v vertical tab
+                .replace('\x0C', "%0C") // \f form feed
+                .replace('\r', "%0D"); // \r carriage return
+            let mut parameters = vec![DispositionParam::Filename(filename_s)];
 
             if !filename.is_ascii() {
                 parameters.push(DispositionParam::FilenameExt(ExtendedValue {
@@ -224,7 +203,6 @@ impl NamedFile {
         })
     }
 
-    #[cfg(not(feature = "experimental-io-uring"))]
     /// Attempts to open a file in read-only mode.
     ///
     /// # Examples
@@ -232,6 +210,7 @@ impl NamedFile {
     /// use actix_files::NamedFile;
     /// let file = NamedFile::open("foo.txt");
     /// ```
+    #[cfg(not(feature = "experimental-io-uring"))]
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<NamedFile> {
         let file = File::open(&path)?;
         Self::from_file(file, path)
@@ -239,8 +218,8 @@ impl NamedFile {
 
     /// Attempts to open a file asynchronously in read-only mode.
     ///
-    /// When the `experimental-io-uring` crate feature is enabled, this will be async.
-    /// Otherwise, it will be just like [`open`][Self::open].
+    /// When the `experimental-io-uring` crate feature is enabled, this will be async. Otherwise, it
+    /// will behave just like `open`.
     ///
     /// # Examples
     /// ```
@@ -265,13 +244,13 @@ impl NamedFile {
         Self::from_file(file, path)
     }
 
-    /// Returns reference to the underlying `File` object.
+    /// Returns reference to the underlying file object.
     #[inline]
     pub fn file(&self) -> &File {
         &self.file
     }
 
-    /// Retrieve the path of this file.
+    /// Returns the filesystem path to this file.
     ///
     /// # Examples
     /// ```
@@ -289,55 +268,92 @@ impl NamedFile {
         self.path.as_path()
     }
 
-    /// Set response **Status Code**
+    /// Returns the time the file was last modified.
+    ///
+    /// Returns `None` only on unsupported platforms; see [`std::fs::Metadata::modified()`].
+    /// Therefore, it is usually safe to unwrap this.
+    #[inline]
+    pub fn modified(&self) -> Option<SystemTime> {
+        self.modified
+    }
+
+    /// Returns the filesystem metadata associated with this file.
+    #[inline]
+    pub fn metadata(&self) -> &Metadata {
+        &self.md
+    }
+
+    /// Returns the `Content-Type` header that will be used when serving this file.
+    #[inline]
+    pub fn content_type(&self) -> &Mime {
+        &self.content_type
+    }
+
+    /// Returns the `Content-Disposition` that will be used when serving this file.
+    #[inline]
+    pub fn content_disposition(&self) -> &ContentDisposition {
+        &self.content_disposition
+    }
+
+    /// Returns the `Content-Encoding` that will be used when serving this file.
+    ///
+    /// A return value of `None` indicates that the content is not already using a compressed
+    /// representation and may be subject to compression downstream.
+    #[inline]
+    pub fn content_encoding(&self) -> Option<ContentEncoding> {
+        self.encoding
+    }
+
+    /// Set response status code.
+    #[deprecated(since = "0.7.0", note = "Prefer `Responder::customize()`.")]
     pub fn set_status_code(mut self, status: StatusCode) -> Self {
         self.status_code = status;
         self
     }
 
-    /// Set the MIME Content-Type for serving this file. By default
-    /// the Content-Type is inferred from the filename extension.
+    /// Sets the `Content-Type` header that will be used when serving this file. By default the
+    /// `Content-Type` is inferred from the filename extension.
     #[inline]
-    pub fn set_content_type(mut self, mime_type: mime::Mime) -> Self {
+    pub fn set_content_type(mut self, mime_type: Mime) -> Self {
         self.content_type = mime_type;
         self
     }
 
-    /// Set the Content-Disposition for serving this file. This allows
-    /// changing the inline/attachment disposition as well as the filename
-    /// sent to the peer.
+    /// Set the Content-Disposition for serving this file. This allows changing the
+    /// `inline/attachment` disposition as well as the filename sent to the peer.
     ///
     /// By default the disposition is `inline` for `text/*`, `image/*`, `video/*` and
-    /// `application/{javascript, json, wasm}` mime types, and `attachment` otherwise,
-    /// and the filename is taken from the path provided in the `open` method
-    /// after converting it to UTF-8 using.
-    /// [`std::ffi::OsStr::to_string_lossy`]
+    /// `application/{javascript, json, wasm}` mime types, and `attachment` otherwise, and the
+    /// filename is taken from the path provided in the `open` method after converting it to UTF-8
+    /// (using `to_string_lossy`).
     #[inline]
-    pub fn set_content_disposition(mut self, cd: header::ContentDisposition) -> Self {
+    pub fn set_content_disposition(mut self, cd: ContentDisposition) -> Self {
         self.content_disposition = cd;
         self.flags.insert(Flags::CONTENT_DISPOSITION);
         self
     }
 
-    /// Disable `Content-Disposition` header.
+    /// Disables `Content-Disposition` header.
     ///
-    /// By default Content-Disposition` header is enabled.
+    /// By default, the `Content-Disposition` header is sent.
     #[inline]
     pub fn disable_content_disposition(mut self) -> Self {
         self.flags.remove(Flags::CONTENT_DISPOSITION);
         self
     }
 
-    /// Set content encoding for serving this file
+    /// Sets content encoding for this file.
     ///
-    /// Must be used with [`actix_web::middleware::Compress`] to take effect.
+    /// This prevents the `Compress` middleware from modifying the file contents and signals to
+    /// browsers/clients how to decode it. For example, if serving a compressed HTML file (e.g.,
+    /// `index.html.gz`) then use `.set_content_encoding(ContentEncoding::Gzip)`.
     #[inline]
     pub fn set_content_encoding(mut self, enc: ContentEncoding) -> Self {
         self.encoding = Some(enc);
         self
     }
 
-    /// Specifies whether to use ETag or not.
+    /// Specifies whether to return `ETag` header in response.
     ///
     /// Default is true.
     #[inline]
@@ -346,7 +362,7 @@ impl NamedFile {
         self
     }
 
-    /// Specifies whether to use Last-Modified or not.
+    /// Specifies whether to return `Last-Modified` header in response.
     ///
     /// Default is true.
     #[inline]
@@ -364,7 +380,7 @@ impl NamedFile {
         self
     }
 
-    /// Creates a etag in a format is similar to Apache's.
+    /// Creates an `ETag` in a format is similar to Apache's.
     pub(crate) fn etag(&self) -> Option<header::EntityTag> {
         self.modified.as_ref().map(|mtime| {
             let ino = {
@@ -386,7 +402,7 @@ impl NamedFile {
                 .duration_since(UNIX_EPOCH)
                 .expect("modification time must be after epoch");
 
-            header::EntityTag::strong(format!(
+            header::EntityTag::new_strong(format!(
                 "{:x}:{:x}:{:x}:{:x}",
                 ino,
                 self.md.len(),
@@ -405,12 +421,13 @@ impl NamedFile {
         if self.status_code != StatusCode::OK {
             let mut res = HttpResponse::build(self.status_code);
 
-            if self.flags.contains(Flags::PREFER_UTF8) {
-                let ct = equiv_utf8_text(self.content_type.clone());
-                res.insert_header((header::CONTENT_TYPE, ct.to_string()));
+            let ct = if self.flags.contains(Flags::PREFER_UTF8) {
+                equiv_utf8_text(self.content_type.clone())
             } else {
-                res.insert_header((header::CONTENT_TYPE, self.content_type.to_string()));
-            }
+                self.content_type
+            };
+
+            res.insert_header((header::CONTENT_TYPE, ct.to_string()));
 
             if self.flags.contains(Flags::CONTENT_DISPOSITION) {
                 res.insert_header((
@@ -420,7 +437,7 @@ impl NamedFile {
             }
 
             if let Some(current_encoding) = self.encoding {
-                res.encoding(current_encoding);
+                res.insert_header((header::CONTENT_ENCODING, current_encoding.as_str()));
             }
 
             let reader = chunked::new_chunked_read(self.md.len(), 0, self.file);
@@ -478,12 +495,13 @@ impl NamedFile {
 
         let mut res = HttpResponse::build(self.status_code);
 
-        if self.flags.contains(Flags::PREFER_UTF8) {
-            let ct = equiv_utf8_text(self.content_type.clone());
-            res.insert_header((header::CONTENT_TYPE, ct.to_string()));
+        let ct = if self.flags.contains(Flags::PREFER_UTF8) {
+            equiv_utf8_text(self.content_type.clone())
         } else {
-            res.insert_header((header::CONTENT_TYPE, self.content_type.to_string()));
-        }
+            self.content_type
+        };
+
+        res.insert_header((header::CONTENT_TYPE, ct.to_string()));
 
         if self.flags.contains(Flags::CONTENT_DISPOSITION) {
             res.insert_header((
@@ -492,9 +510,8 @@ impl NamedFile {
             ));
         }
 
-        // default compressing
         if let Some(current_encoding) = self.encoding {
-            res.encoding(current_encoding);
+            res.insert_header((header::CONTENT_ENCODING, current_encoding.as_str()));
         }
 
         if let Some(lm) = last_modified {
@@ -517,7 +534,27 @@ impl NamedFile {
                     length = ranges[0].length;
                     offset = ranges[0].start;
 
-                    res.encoding(ContentEncoding::Identity);
+                    // When a Content-Encoding header is present in a 206 partial content response
+                    // for video content, it prevents browser video players from starting playback
+                    // before loading the whole video and also prevents seeking.
+                    //
+                    // See: https://github.com/actix/actix-web/issues/2815
+                    //
+                    // The assumption of this fix is that the video player knows to not send an
+                    // Accept-Encoding header for this request and that downstream middleware will
+                    // not attempt compression for requests without it.
+                    //
+                    // TODO: Solve question around what to do if self.encoding is set and partial
+                    // range is requested. Reject request? Ignoring self.encoding seems wrong, too.
+                    // In practice, it should not come up.
+                    if req.headers().contains_key(&header::ACCEPT_ENCODING) {
+                        // don't allow compression middleware to modify partial content
+                        res.insert_header((
+                            header::CONTENT_ENCODING,
+                            HeaderValue::from_static("identity"),
+                        ));
+                    }
+
                     res.insert_header((
                         header::CONTENT_RANGE,
                         format!("bytes {}-{}/{}", offset, offset + length - 1, self.md.len()),
@@ -626,7 +663,7 @@ impl Service<ServiceRequest> for NamedFileService {
     type Error = Error;
     type Future = LocalBoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    actix_service::always_ready!();
+    dev::always_ready!();
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let (req, _) = req.into_parts();

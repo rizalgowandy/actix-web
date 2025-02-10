@@ -4,8 +4,7 @@ use bytes::BytesMut;
 use http::header::{HeaderValue, InvalidHeaderValue};
 
 use crate::{
-    config::DATE_VALUE_LENGTH, error::ParseError, header::TryIntoHeaderValue,
-    helpers::MutWriter,
+    date::DATE_VALUE_LENGTH, error::ParseError, header::TryIntoHeaderValue, helpers::MutWriter,
 };
 
 /// A timestamp with HTTP-style formatting and parsing.
@@ -25,8 +24,7 @@ impl FromStr for HttpDate {
 
 impl fmt::Display for HttpDate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let date_str = httpdate::fmt_http_date(self.0);
-        f.write_str(&date_str)
+        httpdate::HttpDate::from(self.0).fmt(f)
     }
 }
 
@@ -38,7 +36,7 @@ impl TryIntoHeaderValue for HttpDate {
         let mut wrt = MutWriter(&mut buf);
 
         // unwrap: date output is known to be well formed and of known length
-        write!(wrt, "{}", httpdate::fmt_http_date(self.0)).unwrap();
+        write!(wrt, "{}", self).unwrap();
 
         HeaderValue::from_maybe_shared(buf.split().freeze())
     }
